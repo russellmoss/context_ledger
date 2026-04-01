@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+*.js.map
+.context-ledger/inbox.jsonl
+.agent-guard/.auto-fix-ran
+.agent-guard/.docs-stale
