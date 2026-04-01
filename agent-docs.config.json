@@ -1,0 +1,108 @@
+{
+  "$schema": "./agent-docs.schema.json",
+  "projectName": "context-ledger",
+  "techStack": {
+    "framework": "Node.js CLI + MCP Server",
+    "language": "JavaScript/TypeScript"
+  },
+  "docsDir": "docs/",
+  "generatedDir": "docs/_generated/",
+  "architectureFile": "docs/ARCHITECTURE.md",
+  "agentConfigFile": "CLAUDE.md",
+  "additionalAgentConfigs": [],
+  "autoFix": {
+    "generators": true,
+    "narrative": {
+      "enabled": true,
+      "engine": "api",
+      "review": false,
+      "narrativeTriggers": [
+        "env",
+        "source"
+      ],
+      "additionalNarrativeTargets": [
+        "README.md"
+      ],
+      "model": "claude-sonnet-4-20250514",
+      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "maxTokens": 32000,
+      "timeout": 120000
+    },
+    "hook": {
+      "mode": "advisory",
+      "checkOnly": false,
+      "skipIfClaudeRunning": true
+    }
+  },
+  "scanPaths": {
+    "apiRoutes": null,
+    "pageRoutes": null,
+    "prismaSchema": null,
+    "envFile": ".env.example",
+    "sourceDir": "src/"
+  },
+  "categories": [
+    {
+      "id": "env",
+      "name": "Environment Variables",
+      "emoji": "🔑",
+      "filePattern": ".env",
+      "patternType": "exact",
+      "docTarget": "Environment Variables section",
+      "genCommand": "npm run gen:env"
+    },
+    {
+      "id": "source",
+      "name": "Source Files",
+      "emoji": "📦",
+      "filePattern": "src/",
+      "patternType": "startsWith",
+      "docTarget": "Architecture section",
+      "genCommand": null
+    }
+  ],
+  "baselines": {
+    "largeFileThreshold": 500,
+    "largeFileCount": null,
+    "todoCount": null,
+    "highVulnCount": null,
+    "deadExportCount": null
+  },
+  "workflows": {
+    "docsAudit": {
+      "enabled": true,
+      "triggerPaths": [
+        "src/**",
+        ".env"
+      ]
+    },
+    "refactorAudit": {
+      "enabled": true,
+      "schedule": "0 8 * * 0",
+      "labels": [
+        "refactoring",
+        "automated-audit"
+      ]
+    }
+  },
+  "integrations": {
+    "github": {
+      "issueLabels": {
+        "docsAudit": [
+          "documentation",
+          "automated-audit"
+        ],
+        "refactorAudit": [
+          "refactoring",
+          "automated-audit"
+        ]
+      }
+    }
+  },
+  "envCategories": [
+    {
+      "prefix": "DATABASE_",
+      "category": "Database"
+    }
+  ]
+}

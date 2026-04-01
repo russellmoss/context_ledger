@@ -1,0 +1,414 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "agent-docs.config.json",
+  "description": "Configuration for agent-guard — self-healing documentation system for AI-assisted development.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Path to this JSON schema file. Do not modify."
+    },
+    "projectName": {
+      "type": "string",
+      "description": "Display name of your project. Used in generated ARCHITECTURE.md and issue titles.",
+      "default": "My Project"
+    },
+    "techStack": {
+      "type": "object",
+      "description": "Technology stack metadata used in generated ARCHITECTURE.md.",
+      "properties": {
+        "framework": {
+          "type": "string",
+          "description": "Primary framework name and version.",
+          "default": "Next.js 14 (App Router)"
+        },
+        "language": {
+          "type": "string",
+          "description": "Primary language.",
+          "default": "TypeScript"
+        }
+      }
+    },
+    "docsDir": {
+      "type": "string",
+      "description": "Path to your documentation directory, relative to project root.",
+      "default": "docs/"
+    },
+    "generatedDir": {
+      "type": "string",
+      "description": "Path where inventory scripts write generated markdown files. Must be inside docsDir.",
+      "default": "docs/_generated/"
+    },
+    "architectureFile": {
+      "type": "string",
+      "description": "Path to your main architecture documentation file.",
+      "default": "docs/ARCHITECTURE.md"
+    },
+    "agentConfigFile": {
+      "type": "string",
+      "description": "Path to your AI agent configuration file (.cursorrules, .cursor/rules, etc). Standing instructions are appended here.",
+      "default": ".cursorrules"
+    },
+    "additionalAgentConfigs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Additional AI agent config files to write standing instructions to. Enables multi-agent support (e.g., CLAUDE.md, .windsurfrules, .github/copilot-instructions.md).",
+      "default": []
+    },
+    "autoFix": {
+      "type": "object",
+      "description": "Auto-fix behavior during pre-commit hook execution.",
+      "properties": {
+        "generators": {
+          "type": "boolean",
+          "description": "Automatically run inventory generators and stage output at commit time.",
+          "default": true
+        },
+        "narrative": {
+          "type": "object",
+          "description": "AI-powered narrative documentation updates via Claude Code.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Whether to attempt AI-powered narrative updates when Claude Code is available.",
+              "default": true
+            },
+            "engine": {
+              "type": "string",
+              "enum": [
+                "claude-code",
+                "api"
+              ],
+              "description": "AI engine for narrative updates. \"claude-code\" uses CLI subprocess, \"api\" calls Anthropic Messages API directly.",
+              "default": "claude-code"
+            },
+            "model": {
+              "type": "string",
+              "description": "Anthropic model ID for API engine (ignored if engine is \"claude-code\").",
+              "default": "claude-sonnet-4-20250514"
+            },
+            "apiKeyEnv": {
+              "type": "string",
+              "description": "Environment variable name containing the Anthropic API key.",
+              "default": "ANTHROPIC_API_KEY"
+            },
+            "maxTokens": {
+              "type": "integer",
+              "description": "Maximum tokens for API response. Set higher for large ARCHITECTURE.md files.",
+              "default": 32000,
+              "minimum": 1024,
+              "maximum": 128000
+            },
+            "timeout": {
+              "type": "integer",
+              "description": "API request timeout in milliseconds.",
+              "default": 120000,
+              "minimum": 10000,
+              "maximum": 600000
+            },
+            "review": {
+              "type": "boolean",
+              "description": "Show diff and ask for confirmation before staging AI-generated changes.",
+              "default": false
+            },
+            "narrativeTriggers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Category IDs that trigger narrative updates. Only these categories invoke Claude Code.",
+              "default": [
+                "api-routes",
+                "prisma",
+                "env"
+              ]
+            },
+            "additionalNarrativeTargets": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Additional files for Claude Code to update beyond architectureFile. architectureFile is always included automatically.",
+              "default": [
+                "README.md"
+              ]
+            }
+          }
+        },
+        "hook": {
+          "type": "object",
+          "description": "Pre-commit hook behavior settings",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "advisory",
+                "blocking"
+              ],
+              "default": "advisory",
+              "description": "advisory = always exit 0 (never block commits), blocking = exit 1 when docs are stale"
+            },
+            "checkOnly": {
+              "type": "boolean",
+              "default": false,
+              "description": "Skip all AI calls; only detect staleness and report/exit"
+            },
+            "skipIfClaudeRunning": {
+              "type": "boolean",
+              "default": true,
+              "description": "Skip all AI engines when Claude Code is detected as the committer (prevents self-invocation and surprise API costs)"
+            }
+          }
+        }
+      }
+    },
+    "scanPaths": {
+      "type": "object",
+      "description": "File and directory paths that inventory scripts scan.",
+      "properties": {
+        "apiRoutes": {
+          "type": "string",
+          "description": "Directory containing Next.js API route files (route.ts).",
+          "default": "src/app/api/"
+        },
+        "pageRoutes": {
+          "type": "string",
+          "description": "Directory containing Next.js page files (page.tsx).",
+          "default": "src/app/"
+        },
+        "prismaSchema": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Path to Prisma schema file. Set to null if not using Prisma — the model inventory script will be skipped.",
+          "default": null
+        },
+        "envFile": {
+          "type": "string",
+          "description": "Path to your environment variable example/template file.",
+          "default": ".env.example"
+        },
+        "sourceDir": {
+          "type": "string",
+          "description": "Root source directory. Scanned for process.env references and large file detection.",
+          "default": "src/"
+        }
+      },
+      "additionalProperties": true
+    },
+    "categories": {
+      "type": "array",
+      "description": "File change categories monitored by the pre-commit hook. Each category maps a file pattern to a documentation target and optional generator command.",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "filePattern",
+          "patternType",
+          "docTarget"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique identifier for this category (e.g., \"api-routes\", \"prisma\")."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable display name (e.g., \"API Routes\", \"Prisma Schema\")."
+          },
+          "emoji": {
+            "type": "string",
+            "description": "Emoji shown in pre-commit hook output.",
+            "default": "📦"
+          },
+          "filePattern": {
+            "type": "string",
+            "description": "Pattern to match staged files against. Interpretation depends on patternType."
+          },
+          "patternType": {
+            "type": "string",
+            "enum": [
+              "exact",
+              "startsWith",
+              "regex"
+            ],
+            "description": "\"exact\" matches the full path, \"startsWith\" matches the prefix, \"regex\" uses a JavaScript RegExp.",
+            "default": "exact"
+          },
+          "docTarget": {
+            "type": "string",
+            "description": "Which section of ARCHITECTURE.md to update when this category is triggered. Should match a section title in the generated skeleton."
+          },
+          "genCommand": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "npm script to run when this category is triggered (e.g., \"npm run gen:api-routes\"). Null if no generator exists.",
+            "default": null
+          }
+        }
+      }
+    },
+    "baselines": {
+      "type": "object",
+      "description": "Baseline metrics for the weekly refactoring audit. Values of null mean \"not yet detected\" — run `agent-guard detect` to populate.",
+      "properties": {
+        "largeFileThreshold": {
+          "type": "integer",
+          "description": "Line count above which a file is considered \"large\".",
+          "default": 500,
+          "minimum": 100
+        },
+        "largeFileCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Known count of files exceeding largeFileThreshold. Null = auto-detect on next run.",
+          "default": null
+        },
+        "todoCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Known count of TODO/HACK/FIXME comments. Null = auto-detect on next run.",
+          "default": null
+        },
+        "highVulnCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Known count of high/critical npm audit vulnerabilities. Null = auto-detect on next run.",
+          "default": null
+        },
+        "deadExportCount": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Known count of unused exports (detected by knip). Null = auto-detect on next run.",
+          "default": null
+        }
+      }
+    },
+    "workflows": {
+      "type": "object",
+      "description": "GitHub Actions workflow configuration.",
+      "properties": {
+        "docsAudit": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Whether to generate the docs-audit workflow.",
+              "default": true
+            },
+            "triggerPaths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "GitHub Actions path filters. Pushes to main touching these paths trigger the audit. Copy these into docs-audit.yml paths: section."
+            }
+          }
+        },
+        "refactorAudit": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Whether to generate the refactor-audit workflow.",
+              "default": true
+            },
+            "schedule": {
+              "type": "string",
+              "description": "Cron expression for the weekly audit schedule.",
+              "default": "0 8 * * 0"
+            },
+            "labels": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "GitHub issue labels applied to refactoring audit issues.",
+              "default": [
+                "refactoring",
+                "automated-audit"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "integrations": {
+      "type": "object",
+      "description": "External service integrations.",
+      "properties": {
+        "github": {
+          "type": "object",
+          "properties": {
+            "issueLabels": {
+              "type": "object",
+              "description": "Labels applied to auto-created GitHub issues.",
+              "properties": {
+                "docsAudit": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "default": [
+                    "documentation",
+                    "automated-audit"
+                  ]
+                },
+                "refactorAudit": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "default": [
+                    "refactoring",
+                    "automated-audit"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "envCategories": {
+      "type": "array",
+      "description": "Environment variable prefix-to-category mapping. Used by the env inventory script to group variables.",
+      "items": {
+        "type": "object",
+        "required": [
+          "prefix",
+          "category"
+        ],
+        "properties": {
+          "prefix": {
+            "type": "string",
+            "description": "Env var name prefix (e.g., \"NEXTAUTH_\", \"DATABASE_\")."
+          },
+          "category": {
+            "type": "string",
+            "description": "Display category name (e.g., \"Auth (NextAuth)\", \"Database\")."
+          }
+        }
+      }
+    }
+  },
+  "required": [
+    "projectName",
+    "categories"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,138 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Documentation Drift Audit — agent-guard
+#
+# Triggers on push to main when doc-relevant code changes.
+# Regenerates inventory files and diffs against committed versions.
+# Creates a GitHub Issue with remediation instructions if drift is detected.
+#
+# SETUP: Copy the triggerPaths from your agent-docs.config.json into the
+# paths: list below. This cannot be dynamically loaded from JSON in GitHub
+# Actions — it must be hardcoded in the YAML.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Documentation Drift Audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # CUSTOMIZE: Copy paths from agent-docs.config.json → workflows.docsAudit.triggerPaths
+      - 'src/app/api/**'
+      - 'src/app/*/page.tsx'
+      - '.env.example'
+      # Add more paths matching your config categories:
+      # - 'prisma/schema.prisma'
+      # - 'src/lib/permissions.ts'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Regenerate inventories from current code
+        run: npm run gen:all
+
+      - name: Check for inventory drift
+        id: check-drift
+        run: |
+          DRIFT_FOUND=false
+          DRIFT_DETAILS=""
+
+          for file in docs/_generated/*.md; do
+            if [ -f "$file" ]; then
+              if ! git diff --exit-code --quiet "$file" 2>/dev/null; then
+                DRIFT_FOUND=true
+                DIFF_OUTPUT=$(git diff --stat "$file" 2>/dev/null || true)
+                DRIFT_DETAILS="${DRIFT_DETAILS}\n### $(basename $file)\n\`\`\`\n${DIFF_OUTPUT}\n\`\`\`\n"
+              fi
+            fi
+          done
+
+          echo "drift_found=$DRIFT_FOUND" >> $GITHUB_OUTPUT
+          if [ "$DRIFT_FOUND" = true ]; then
+            # Write drift details to a temp file (avoids shell escaping issues)
+            echo -e "$DRIFT_DETAILS" > /tmp/drift-details.txt
+          fi
+
+      - name: Quality check on documentation
+        if: always()
+        run: node scripts/quality-check.cjs
+
+      - name: Create issue for documentation drift
+        if: steps.check-drift.outputs.drift_found == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const actor = context.actor;
+            const sha = context.sha.substring(0, 7);
+            const driftDetails = fs.readFileSync('/tmp/drift-details.txt', 'utf8');
+
+            const issueBody = [
+              '## Documentation Drift Detected',
+              '',
+              'Generated inventory files are out of sync with the codebase.',
+              'This means code was pushed to main without regenerating the inventories.',
+              '',
+              `**Triggered by**: Push to \`main\` by @${actor}`,
+              `**Commit**: ${sha}`,
+              '',
+              '---',
+              '',
+              '## Drift Details',
+              '',
+              driftDetails,
+              '',
+              '---',
+              '',
+              '## How to Fix',
+              '',
+              '### Option A: Run inventory scripts (quick fix)',
+              '```bash',
+              'npm run gen:all',
+              'git add docs/_generated/',
+              'git commit -m "docs: regenerate inventories"',
+              'git push',
+              '```',
+              '',
+              '### Option B: AI agent prompt (if ARCHITECTURE.md also needs updating)',
+              '```',
+              'Documentation drift was detected after a push to main.',
+              '',
+              '1. Run: npm run gen:all',
+              '2. Read the regenerated files in docs/_generated/ to understand what changed',
+              '3. Update the architecture doc to reflect the new routes/models/env vars',
+              '4. Follow the Documentation Maintenance standing instructions in your agent config',
+              '',
+              'Rules:',
+              '- Read each changed file BEFORE updating docs',
+              '- Match the existing format in the architecture doc',
+              '- Do NOT modify any source code files',
+              '```',
+              '',
+              '---',
+              '_This issue was created automatically by the agent-guard Documentation Drift Audit._'
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Documentation drift detected — inventories out of sync',
+              body: issueBody,
+              labels: ['documentation', 'automated-audit']
+            });

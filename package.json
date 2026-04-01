@@ -23,7 +23,11 @@
     "start": "node dist/cli.js",
     "smoke": "node dist/smoke.js",
     "setup": "node dist/setup.js",
-    "prepublishOnly": "npm run rebuild"
+    "prepublishOnly": "npm run rebuild",
+    "gen:api-routes": "node scripts/generate-api-inventory.cjs",
+    "gen:env": "node scripts/generate-env-inventory.cjs",
+    "gen:all": "npm run gen:api-routes && npm run gen:env",
+    "prepare": "husky"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -39,6 +43,7 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@mossrussell/agent-guard": "^0.6.3",
     "@types/node": "^25.5.0",
     "rimraf": "^6.1.3",
     "typescript": "^6.0.2",

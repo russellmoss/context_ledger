@@ -1,0 +1,232 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Weekly Refactoring Audit — agent-guard
+#
+# Runs weekly (and on manual dispatch) to detect codebase health regression.
+# Compares current metrics against baselines from agent-docs.config.json.
+# Creates a GitHub Issue ONLY when metrics worsen beyond baselines.
+#
+# BASELINES: Read from agent-docs.config.json. If null, auto-detected on first run.
+# Run `npx agent-guard detect` locally to set initial baselines.
+#
+# DEAD EXPORTS: Uses knip (not grep). knip must be in devDependencies.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: Weekly Refactoring Audit
+
+on:
+  schedule:
+    - cron: '0 8 * * 0'  # Sundays 8 AM UTC — override in config
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  refactor-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Read baselines from config
+        id: baselines
+        run: |
+          CONFIG_FILE="agent-docs.config.json"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Config file not found. Using zero baselines."
+            echo "large=0" >> $GITHUB_OUTPUT
+            echo "todos=0" >> $GITHUB_OUTPUT
+            echo "vulns=0" >> $GITHUB_OUTPUT
+            echo "dead=0" >> $GITHUB_OUTPUT
+            echo "threshold=500" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Extract baselines with null-safe fallbacks
+          LARGE=$(node -e "try{const c=JSON.parse(require('fs').readFileSync('$CONFIG_FILE','utf8'));console.log(c.baselines?.largeFileCount??0)}catch{console.log(0)}")
+          TODOS=$(node -e "try{const c=JSON.parse(require('fs').readFileSync('$CONFIG_FILE','utf8'));console.log(c.baselines?.todoCount??0)}catch{console.log(0)}")
+          VULNS=$(node -e "try{const c=JSON.parse(require('fs').readFileSync('$CONFIG_FILE','utf8'));console.log(c.baselines?.highVulnCount??0)}catch{console.log(0)}")
+          DEAD=$(node -e "try{const c=JSON.parse(require('fs').readFileSync('$CONFIG_FILE','utf8'));console.log(c.baselines?.deadExportCount??0)}catch{console.log(0)}")
+          THRESHOLD=$(node -e "try{const c=JSON.parse(require('fs').readFileSync('$CONFIG_FILE','utf8'));console.log(c.baselines?.largeFileThreshold??500)}catch{console.log(500)}")
+
+          echo "large=$LARGE" >> $GITHUB_OUTPUT
+          echo "todos=$TODOS" >> $GITHUB_OUTPUT
+          echo "vulns=$VULNS" >> $GITHUB_OUTPUT
+          echo "dead=$DEAD" >> $GITHUB_OUTPUT
+          echo "threshold=$THRESHOLD" >> $GITHUB_OUTPUT
+
+      - name: Scan for large files
+        id: large-files
+        run: |
+          THRESHOLD=${{ steps.baselines.outputs.threshold }}
+          find src/ -name '*.ts' -o -name '*.tsx' -o -name '*.js' -o -name '*.jsx' 2>/dev/null | while read f; do
+            LINES=$(wc -l < "$f" 2>/dev/null || echo 0)
+            if [ "$LINES" -gt "$THRESHOLD" ]; then echo "$LINES $f"; fi
+          done | sort -rn > /tmp/large-files.txt || true
+          LARGE_COUNT=$(wc -l < /tmp/large-files.txt 2>/dev/null || echo 0)
+          echo "count=$LARGE_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Scan for TODO/HACK/FIXME
+        id: todos
+        run: |
+          grep -rn --include='*.ts' --include='*.tsx' --include='*.js' --include='*.jsx' \
+            'TODO\|HACK\|FIXME' src/ 2>/dev/null > /tmp/todos.txt || true
+          TODO_COUNT=$(wc -l < /tmp/todos.txt 2>/dev/null || echo 0)
+          echo "count=$TODO_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Run npm audit
+        id: npm-audit
+        run: |
+          npm audit --json --omit=dev 2>/dev/null > /tmp/npm-audit.json || true
+          HIGH_COUNT=$(node -e "
+            try {
+              const d = JSON.parse(require('fs').readFileSync('/tmp/npm-audit.json', 'utf8'));
+              const v = d.metadata && d.metadata.vulnerabilities;
+              console.log(v ? ((v.high || 0) + (v.critical || 0)) : 0);
+            } catch(e) { console.log(0); }
+          ")
+          echo "high_count=$HIGH_COUNT" >> $GITHUB_OUTPUT
+          npm audit --omit=dev 2>/dev/null | tail -5 > /tmp/npm-audit-summary.txt || true
+
+      - name: Scan for unused exports (knip)
+        id: dead-exports
+        run: |
+          # knip exits 1 when unused exports are found — || true prevents step failure
+          npx knip --reporter json 2>/dev/null > /tmp/knip-output.json || true
+
+          DEAD_COUNT=$(node -e "
+            try {
+              const d = JSON.parse(require('fs').readFileSync('/tmp/knip-output.json', 'utf8'));
+              const issues = d.issues || [];
+              let count = 0;
+              issues.forEach(i => { count += (i.exports || []).length; });
+              console.log(count);
+            } catch(e) { console.log(0); }
+          ")
+          echo "dead_count=$DEAD_COUNT" >> $GITHUB_OUTPUT
+
+          # Build human-readable list for issue body
+          node -e "
+            try {
+              const d = JSON.parse(require('fs').readFileSync('/tmp/knip-output.json', 'utf8'));
+              const issues = d.issues || [];
+              const lines = [];
+              issues.forEach(i => {
+                (i.exports || []).forEach(e => {
+                  lines.push('- \`' + e.name + '\` in ' + i.file);
+                });
+              });
+              require('fs').writeFileSync('/tmp/dead-exports.txt', lines.slice(0, 30).join('\n') || 'None found');
+            } catch(e) {
+              require('fs').writeFileSync('/tmp/dead-exports.txt', 'knip analysis unavailable');
+            }
+          "
+
+      - name: Create issue if metrics worsened
+        uses: actions/github-script@v7
+        env:
+          BASELINE_LARGE: ${{ steps.baselines.outputs.large }}
+          BASELINE_TODOS: ${{ steps.baselines.outputs.todos }}
+          BASELINE_VULNS: ${{ steps.baselines.outputs.vulns }}
+          BASELINE_DEAD: ${{ steps.baselines.outputs.dead }}
+          LARGE_COUNT: ${{ steps.large-files.outputs.count }}
+          TODO_COUNT: ${{ steps.todos.outputs.count }}
+          HIGH_COUNT: ${{ steps.npm-audit.outputs.high_count }}
+          DEAD_COUNT: ${{ steps.dead-exports.outputs.dead_count }}
+        with:
+          script: |
+            const fs = require('fs');
+            const baselineL = parseInt(process.env.BASELINE_LARGE) || 0;
+            const baselineT = parseInt(process.env.BASELINE_TODOS) || 0;
+            const baselineV = parseInt(process.env.BASELINE_VULNS) || 0;
+            const baselineD = parseInt(process.env.BASELINE_DEAD) || 0;
+            const largeCount = parseInt(process.env.LARGE_COUNT) || 0;
+            const todoCount = parseInt(process.env.TODO_COUNT) || 0;
+            const highCount = parseInt(process.env.HIGH_COUNT) || 0;
+            const deadCount = parseInt(process.env.DEAD_COUNT) || 0;
+
+            // Only create issue if ANY metric worsened
+            const worsened =
+              largeCount > baselineL ||
+              todoCount > baselineT ||
+              highCount > baselineV ||
+              deadCount > baselineD;
+
+            if (!worsened) {
+              console.log('All metrics at or below baselines. No issue needed.');
+              return;
+            }
+
+            const date = new Date().toISOString().slice(0, 10);
+            const flag = (current, baseline) =>
+              current > baseline
+                ? `**${current}** (baseline: ${baseline}) — NEW REGRESSION`
+                : `${current} (baseline: ${baseline})`;
+
+            const largeFiles = fs.readFileSync('/tmp/large-files.txt', 'utf8').trim() || 'None';
+            const todos = fs.readFileSync('/tmp/todos.txt', 'utf8').trim().slice(0, 3000) || 'None';
+            const auditSummary = fs.readFileSync('/tmp/npm-audit-summary.txt', 'utf8').trim() || 'N/A';
+            const deadExports = fs.readFileSync('/tmp/dead-exports.txt', 'utf8').trim() || 'None';
+
+            const issueBody = [
+              `## Weekly Refactoring Audit — ${date}`,
+              '',
+              '> Metrics exceeding baselines are flagged as regressions.',
+              '> Baselines are from `agent-docs.config.json`. Re-calibrate with `npx agent-guard detect`.',
+              '',
+              '---',
+              '',
+              '### Large Files',
+              flag(largeCount, baselineL),
+              '```', largeFiles, '```',
+              '',
+              '### TODO/HACK/FIXME',
+              flag(todoCount, baselineT),
+              '',
+              '### Dependency Vulnerabilities',
+              flag(highCount, baselineV),
+              '```', auditSummary, '```',
+              '',
+              '### Unused Exports (knip)',
+              flag(deadCount, baselineD),
+              deadExports,
+              '',
+              '---',
+              '',
+              '### AI Agent Remediation Prompt',
+              '```',
+              `You are performing the weekly refactoring audit remediation.`,
+              `Date: ${date}`,
+              '',
+              'Read this entire prompt before starting. Work through each section in priority order.',
+              'Only make changes you are confident are safe.',
+              '',
+              'RULES:',
+              '- Read each file BEFORE making any changes',
+              '- Run npx tsc --noEmit after each change to verify no type errors',
+              '- Do NOT remove exports unless you verify zero consumers',
+              '- For npm vulns: prefer npm audit fix over npm audit fix --force',
+              '- After all changes: npm run gen:all to regenerate inventories',
+              '```',
+              '',
+              '---',
+              '_Created by agent-guard Weekly Refactoring Audit._',
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Weekly Refactoring Audit — ${date}`,
+              body: issueBody,
+              labels: ['refactoring', 'automated-audit']
+            });
