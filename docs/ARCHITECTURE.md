@@ -14,7 +14,7 @@ via MCP so AI agents stop repeating mistakes.
 - Validation: Zod schemas for MCP tool parameters
 
 ## Architecture
-- Entry points: CLI (cli.ts), MCP Server (mcp-server.ts + mcp-server-bin.ts), Setup Wizard (setup.ts)
+- Entry points: CLI (cli.ts), MCP Server (mcp-server.ts + mcp-server-bin.ts)
 - Ledger: Event-sourced JSONL with decision records and transition events
 - Inbox: Structured JSONL queue with TTL and lifecycle management
 - Capture: Post-commit hook (instantaneous, zero LLM calls) + workflow write-back
@@ -31,7 +31,6 @@ from 4 rounds of adversarial review.
 - src/retrieval/ — query_decisions implementation, scope derivation, decision pack builder
 - src/mcp/ — MCP tool registrations (read + write tools with Zod validation)
 - src/cli.ts — CLI commands (init, serve, validate, tidy, stats, export, backfill, query)
-- src/setup.ts — Interactive setup wizard (@clack/prompts)
 - src/config.ts — Configuration loader with deep merge, scope mappings, hint mappings
 - src/index.ts — Library entry point with re-exports
 - src/mcp-server.ts — MCP server implementation
@@ -60,6 +59,7 @@ from 4 rounds of adversarial review.
 - **Deep Merge**: Hierarchical config loading with type-safe defaults
 - **Scope Mappings**: File path to scope derivation rules
 - **Feature Hints**: Query expansion mappings for retrieval
+- **Environment Variables**: Supports CONTEXT_LEDGER_PROJECT_ROOT for custom project root configuration
 
 ## Ecosystem
 - agent-guard: Keeps the "what" accurate (inventories, doc sync, session context)

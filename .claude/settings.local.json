@@ -22,7 +22,10 @@
       "Bash(mkdir:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(printf \"All nullable columns use COALESCE with sensible defaults\\\\nPrevents NULL propagation bugs in aggregation queries\\\\nFilter NULLs before aggregation,Use IFNULL instead\\\\nIf we move to a database that handles NULLs differently\\\\ndomain\\\\nquery-layer\\\\nconvention\\\\nprecedent\\\\nsrc/retrieval/query.ts\\\\nnull-handling,sql\")",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(npx agent-guard:*)"
     ]
   }
 }

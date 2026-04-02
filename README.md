@@ -154,7 +154,6 @@ context-ledger backfill --resume             # Resume interrupted backfill
 
 ```bash
 context-ledger serve                         # Start MCP server over stdio
-context-ledger setup                         # Interactive setup wizard (coming soon)
 context-ledger --help                        # Full command list
 context-ledger --version                     # Package version
 ```
@@ -240,6 +239,8 @@ npm install --save-dev @mossrussell/agent-guard @mossrussell/context-ledger coun
 
 Scope mappings let you give meaningful names to areas of your codebase. Without them, scope is derived from directory names. With them, `src/ledger/` maps to `domain/ledger-core` and queries become much more precise.
 
+The `CONTEXT_LEDGER_PROJECT_ROOT` environment variable can be used to override the default project root detection when the tool is run from outside the project directory.
+
 See `context-ledger-design-v2.md` for the full config schema and all options.
 
 ## What's Coming
@@ -247,7 +248,6 @@ See `context-ledger-design-v2.md` for the full config schema and all options.
 The core loop (capture via MCP, store, fold, retrieve, CLI) is fully functional. These are still in progress:
 
 - **Post-commit hook automation** (`src/capture/`): Automatic change classification and inbox drafting on every commit. Currently a stub. The hook infrastructure is installed by `init`, but the classification logic is pending.
-- **Setup wizard** (`context-ledger setup`): Interactive guided configuration with scope mapping generation and first-run demo. Currently prints "not yet implemented."
 - **Inbox management**: Dedicated inbox query and management tools. Currently handled through MCP write tools and `tidy`.
 
 These are enhancements to the capture pipeline. The decision storage, retrieval, and MCP interface are complete and production-ready.

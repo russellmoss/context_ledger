@@ -6,6 +6,7 @@ import { readFile, mkdir, writeFile, access, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline/promises";
 
 // Internal imports — all .js extensions
 import { DEFAULT_CONFIG, loadConfig } from "./config.js";
@@ -13,7 +14,7 @@ import {
   readLedger, readInbox, rewriteInbox, foldLedger,
   LedgerIntegrityError, ledgerDir, ledgerPath, inboxPath, configPath,
   isDecisionRecord, isTransitionEvent,
-  generateInboxId, appendToInbox,
+  generateDecisionId, generateInboxId, appendToLedger, appendToInbox,
 } from "./ledger/index.js";
 import type {
   FoldedDecision, MaterializedState, LifecycleState,
@@ -44,7 +45,7 @@ function hasFlag(flag: string): boolean {
 
 // ── Pre-flight ────────────────────────────────────────────────────────────────
 
-const NEEDS_LEDGER = new Set(["query", "stats", "export", "validate", "tidy", "backfill"]);
+const NEEDS_LEDGER = new Set(["query", "stats", "export", "validate", "tidy", "backfill", "capture"]);
 
 async function ensureLedgerExists(): Promise<void> {
   if (!NEEDS_LEDGER.has(command)) return;
@@ -71,6 +72,7 @@ async function main(): Promise<void> {
     case "validate": return handleValidate();
     case "tidy": return handleTidy();
     case "backfill": return handleBackfill();
+    case "capture": return handleCapture();
     case "setup": return handleSetup();
     case "--help": case "-h": return printHelp();
     case "--version": case "-v": return printVersion();
@@ -99,6 +101,7 @@ Commands:
   tidy                          Remove stale inbox entries (>30 days)
   backfill --max <N>            Backfill from git history (default 5)
   backfill --resume             Resume interrupted backfill
+  capture '<summary>'           Capture a convention or decision manually
   setup                         Run interactive setup wizard
 
 Options:
@@ -474,13 +477,29 @@ async function installPostCommitHook(): Promise<void> {
 node -e "import('context-ledger/dist/capture/hook.js').then(m => m.postCommit()).catch(() => {})" 2>/dev/null || true
 `;
 
+  // The line we check for to detect an existing context-ledger hook
+  const marker = "context-ledger";
+
   // Check for Husky (.husky/)
   const huskyDir = join(projectRoot, ".husky");
   try {
     await access(huskyDir);
     const hookPath = join(huskyDir, "post-commit");
-    await writeFile(hookPath, hookScript, { mode: 0o755 });
-    console.log("Installed post-commit hook via Husky (.husky/post-commit)");
+    try {
+      await access(hookPath);
+      // Hook file exists — read it, check for marker, append if missing
+      const existing = await readFile(hookPath, "utf8");
+      if (!existing.includes(marker)) {
+        await writeFile(hookPath, existing.trimEnd() + "\n\n" + hookScript, { mode: 0o755 });
+        console.log("Appended context-ledger to existing .husky/post-commit");
+      } else {
+        console.log("Husky post-commit hook already contains context-ledger, skipping.");
+      }
+    } catch {
+      // No existing hook file — create
+      await writeFile(hookPath, hookScript, { mode: 0o755 });
+      console.log("Installed post-commit hook via Husky (.husky/post-commit)");
+    }
     return;
   } catch { /* not husky */ }
 
@@ -511,7 +530,7 @@ node -e "import('context-ledger/dist/capture/hook.js').then(m => m.postCommit())
       await access(hookPath);
       // Hook already exists — append
       const existing = await readFile(hookPath, "utf8");
-      if (!existing.includes("context-ledger")) {
+      if (!existing.includes(marker)) {
         await writeFile(hookPath, existing.trimEnd() + "\n\n" + hookScript, { mode: 0o755 });
         console.log("Appended context-ledger to existing .git/hooks/post-commit");
       } else {
@@ -808,6 +827,103 @@ async function resumeBackfill(maxCommits: number): Promise<void> {
   }
 
   console.log(`Drafted ${captured} inbox item(s).`);
+}
+
+// ── capture ───────────────────────────────────────────────────────────────────
+
+async function handleCapture(): Promise<void> {
+  if (hasFlag("--help")) {
+    console.log(`Usage: context-ledger capture '<summary>'
+  Interactively capture a convention or architectural decision.
+  Writes directly to the ledger as source: manual, evidence_type: explicit_manual.
+
+  Example:
+    context-ledger capture 'All API responses use COALESCE with sensible defaults'`);
+    return;
+  }
+
+  const summary = args.slice(1).filter((a) => !a.startsWith("--")).join(" ");
+  if (!summary) {
+    console.error("Usage: context-ledger capture '<summary>'");
+    console.error("Example: context-ledger capture 'Use COALESCE with sensible defaults for nullable columns'");
+    process.exit(1);
+  }
+
+  if (!process.stdin.isTTY) {
+    console.error("Error: capture requires an interactive terminal.");
+    console.error("Run this command directly (not piped) so you can answer the prompts.");
+    process.exit(1);
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+
+  try {
+    console.error(`\nCapturing decision: "${summary}"\n`);
+
+    const decision = await rl.question("Decision (what was decided, in detail):\n> ");
+    const rationale = await rl.question("\nRationale (why this approach):\n> ");
+
+    const altInput = await rl.question("\nAlternatives considered (comma-separated, or empty to skip):\n> ");
+    const alternatives = altInput.trim()
+      ? altInput.split(",").map((a) => ({
+          approach: a.trim(),
+          why_rejected: "Not specified",
+          failure_conditions: null,
+        }))
+      : [];
+
+    const revisit = await rl.question("\nRevisit conditions (when to reconsider, or empty):\n> ");
+
+    const scopeType = await rl.question("\nScope type (package, directory, domain, concern, integration) [domain]:\n> ") || "domain";
+    const scopeId = await rl.question("Scope ID (e.g. 'query-layer', 'auth', 'ledger-core'):\n> ");
+    if (!scopeId) {
+      console.error("Scope ID is required.");
+      process.exit(1);
+    }
+
+    const kind = await rl.question("\nDecision kind (e.g. 'convention', 'pattern', 'constraint') [convention]:\n> ") || "convention";
+    const durability = await rl.question("Durability (precedent, feature-local, temporary-workaround) [precedent]:\n> ") || "precedent";
+
+    const filesInput = await rl.question("\nAffected files (comma-separated paths, or empty):\n> ");
+    const affectedFiles = filesInput.trim() ? filesInput.split(",").map((f) => f.trim()) : [];
+
+    const tagsInput = await rl.question("Tags (comma-separated, or empty):\n> ");
+    const tags = tagsInput.trim() ? tagsInput.split(",").map((t) => t.trim()) : [];
+
+    const record: DecisionRecord = {
+      type: "decision",
+      id: generateDecisionId(),
+      created: new Date().toISOString(),
+      source: "manual",
+      evidence_type: "explicit_manual",
+      verification_status: "confirmed",
+      commit_sha: null,
+      summary,
+      decision: decision || summary,
+      alternatives_considered: alternatives,
+      rationale: rationale || "Not specified",
+      revisit_conditions: revisit || "",
+      review_after: durability === "temporary-workaround"
+        ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
+        : null,
+      scope: { type: scopeType as any, id: scopeId },
+      affected_files: affectedFiles,
+      scope_aliases: [],
+      decision_kind: kind,
+      tags,
+      durability: durability as any,
+    };
+
+    await appendToLedger(record, projectRoot);
+
+    console.log(`\nDecision captured: ${record.id}`);
+    console.log(`  Summary: ${summary}`);
+    console.log(`  Scope: ${scopeType}/${scopeId}`);
+    console.log(`  Durability: ${durability}`);
+    console.log(`  Evidence: explicit_manual (weight 1.0)`);
+  } finally {
+    rl.close();
+  }
 }
 
 // ── setup ─────────────────────────────────────────────────────────────────────

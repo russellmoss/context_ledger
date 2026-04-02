@@ -54,7 +54,10 @@ export function deriveScope(
           (k) => normalizePath(k) === key,
         )!;
         const mapping = config.capture.scope_mappings[originalKey];
-        return { type: mapping.type, id: mapping.id, source: "config_mapping" };
+        const resolved = normalizeScopeMapping(mapping);
+        if (resolved) {
+          return { type: resolved.type, id: resolved.id, source: "config_mapping" };
+        }
       }
     }
 
@@ -118,4 +121,31 @@ export function deriveScopeFromHints(
   }
 
   return matched;
+}
+
+// ── Scope Mapping Normalization ─────────────────────────────────────────────
+
+/**
+ * Accepts both canonical { type, id } format and shorthand like { domain: "query-layer" }.
+ * Returns null if the mapping is empty or unrecognizable.
+ */
+function normalizeScopeMapping(mapping: any): { type: ScopeType; id: string } | null {
+  // Canonical format: { type: "domain", id: "query-layer" }
+  if (mapping && typeof mapping.type === "string" && typeof mapping.id === "string") {
+    return { type: mapping.type as ScopeType, id: mapping.id };
+  }
+
+  // Shorthand format: { domain: "query-layer" } — first key is type, value is id
+  if (mapping && typeof mapping === "object") {
+    const keys = Object.keys(mapping);
+    if (keys.length === 1) {
+      const type = keys[0];
+      const id = mapping[type];
+      if (typeof id === "string") {
+        return { type: type as ScopeType, id };
+      }
+    }
+  }
+
+  return null;
 }
