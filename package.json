@@ -6,7 +6,7 @@
   "main": "dist/index.js",
   "bin": {
     "context-ledger": "dist/cli.js",
-    "context-ledger-mcp": "dist/mcp-server.js",
+    "context-ledger-mcp": "dist/mcp-server-bin.js",
     "context-ledger-setup": "dist/setup.js"
   },
   "files": [
@@ -27,7 +27,11 @@
     "gen:api-routes": "node scripts/generate-api-inventory.cjs",
     "gen:env": "node scripts/generate-env-inventory.cjs",
     "gen:all": "npm run gen:api-routes && npm run gen:env",
-    "prepare": "husky"
+    "test:integration": "node dist/ledger/smoke-test.js",
+    "test:retrieval": "node dist/retrieval/smoke-test.js",
+    "test:dogfood": "node dist/ledger/dogfood.js",
+    "test:mcp": "node dist/mcp/smoke-test.js",
+    "prepare": "npx husky"
   },
   "engines": {
     "node": ">=18.0.0"
@@ -39,14 +43,14 @@
     "url": "https://github.com/russellmoss/context-ledger"
   },
   "dependencies": {
-    "@clack/prompts": "^1.2.0"
+    "@clack/prompts": "^1.2.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
     "@mossrussell/agent-guard": "^0.6.3",
     "@types/node": "^25.5.0",
     "rimraf": "^6.1.3",
-    "typescript": "^6.0.2",
-    "zod": "^4.3.6"
+    "typescript": "^6.0.2"
   }
 }

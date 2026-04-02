@@ -2,7 +2,24 @@
   "permissions": {
     "allow": [
       "Bash(git init:*)",
-      "Bash(git remote:*)"
+      "Bash(git remote:*)",
+      "mcp__context-ledger__query_decisions",
+      "Bash(node -e ':*)",
+      "Bash(python3 /c/Users/russe/documents/context_ledger/write_findings_helper.js)",
+      "Bash(node:*)",
+      "Bash(python3:*)",
+      "Bash(printf '%s\\\\n' \"const fs = require\\('fs'\\);\" \"const OUT = 'C:/Users/russe/documents/context_ledger/code-inspector-findings.md';\" \"const lines = [];\" \"const a = \\(s\\) => lines.push\\(s\\);\")",
+      "Read(//tmp/**)",
+      "Bash(printf '%s\\\\n' \"import os\")",
+      "Bash(printf '%s\\\\n' 'dest = \"C:/Users/russe/documents/context_ledger/gen_findings.cjs\"')",
+      "Bash(printf '%s\\\\n' 'target = \"C:/Users/russe/documents/context_ledger/pattern-finder-findings.md\"')",
+      "Bash(printf '%s\\\\n' 'import os, json')",
+      "mcp__council-mcp__ask_openai",
+      "mcp__council-mcp__ask_gemini",
+      "Bash(npx tsc:*)",
+      "Bash(echo \"exit code: $?\")",
+      "Bash(echo \"exit: $?\")",
+      "Bash(mkdir:*)"
     ]
   }
 }

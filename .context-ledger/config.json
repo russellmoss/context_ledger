@@ -1,0 +1,34 @@
+{
+  "capture": {
+    "enabled": true,
+    "ignore_paths": [
+      "dist/",
+      "node_modules/",
+      ".next/",
+      "coverage/"
+    ],
+    "scope_mappings": {},
+    "redact_patterns": [],
+    "no_capture_marker": "[no-capture]",
+    "inbox_ttl_days": 14,
+    "inbox_max_prompts_per_item": 3,
+    "inbox_max_items_per_session": 3
+  },
+  "retrieval": {
+    "default_limit": 20,
+    "include_superseded": false,
+    "include_unreviewed": false,
+    "auto_promotion_min_weight": 0.7,
+    "token_budget": 4000,
+    "feature_hint_mappings": {}
+  },
+  "workflow_integration": {
+    "selective_writeback": true,
+    "check_inbox_on_session_start": true,
+    "jit_backfill": true
+  },
+  "monorepo": {
+    "package_name": null,
+    "root_relative_path": null
+  }
+}

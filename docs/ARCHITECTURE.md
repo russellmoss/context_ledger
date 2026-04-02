@@ -11,9 +11,10 @@ via MCP so AI agents stop repeating mistakes.
 - MCP SDK: @modelcontextprotocol/sdk
 - Interactive UI: @clack/prompts
 - Storage: Local JSONL (event-sourced, append-only)
+- Validation: Zod schemas for MCP tool parameters
 
 ## Architecture
-- Entry points: CLI (cli.ts), MCP Server (index.ts), Setup Wizard (setup.ts)
+- Entry points: CLI (cli.ts), MCP Server (mcp-server.ts + mcp-server-bin.ts), Setup Wizard (setup.ts)
 - Ledger: Event-sourced JSONL with decision records and transition events
 - Inbox: Structured JSONL queue with TTL and lifecycle management
 - Capture: Post-commit hook (instantaneous, zero LLM calls) + workflow write-back
@@ -25,13 +26,40 @@ See context-ledger-design-v2.md for the full design spec with 47 traced decision
 from 4 rounds of adversarial review.
 
 ## Module Map
-- src/ledger/ — Event types, fold logic, inbox management, validation
+- src/ledger/ — Event types, fold logic, inbox management, validation, storage operations
 - src/capture/ — Post-commit hook, change classification
-- src/retrieval/ — query_decisions, scope derivation, decision pack builder
-- src/mcp/ — MCP tool registrations (read + write tools)
-- src/cli.ts — CLI commands (init, validate, tidy, stats, export, backfill)
+- src/retrieval/ — query_decisions implementation, scope derivation, decision pack builder
+- src/mcp/ — MCP tool registrations (read + write tools with Zod validation)
+- src/cli.ts — CLI commands (init, serve, validate, tidy, stats, export, backfill, query)
 - src/setup.ts — Interactive setup wizard (@clack/prompts)
-- src/config.ts — Default configuration, scope mappings, hint mappings
+- src/config.ts — Configuration loader with deep merge, scope mappings, hint mappings
+- src/index.ts — Library entry point with re-exports
+- src/mcp-server.ts — MCP server implementation
+- src/mcp-server-bin.ts — Standalone MCP server binary
+
+## Core Components
+
+### Event System
+- **Events**: DecisionRecord and TransitionEvent types with comprehensive type guards
+- **Fold Logic**: Event replay with lifecycle state machine, auto-expiry, and integrity checking
+- **Storage**: Append-only JSONL with line-by-line corruption handling
+
+### MCP Integration
+- **Read Tools**: query_decisions with decision pack output
+- **Write Tools**: propose_decision, confirm_pending, reject_pending, supersede_decision, record_writeback
+- **Validation**: Zod schemas for all tool parameters with detailed descriptions
+- **Error Handling**: Structured error responses with diagnostic logging
+
+### CLI Interface
+- **Command Dispatch**: Full feature CLI with help system and version reporting
+- **Validation**: Integrity checking with repair suggestions and strict/lenient modes
+- **Backfill**: Git history analysis with structural commit detection and resumable processing
+- **Statistics**: Decision analytics with grouping by source, kind, scope, evidence, and lifecycle state
+
+### Configuration System
+- **Deep Merge**: Hierarchical config loading with type-safe defaults
+- **Scope Mappings**: File path to scope derivation rules
+- **Feature Hints**: Query expansion mappings for retrieval
 
 ## Ecosystem
 - agent-guard: Keeps the "what" accurate (inventories, doc sync, session context)

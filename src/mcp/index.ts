@@ -1,2 +1,5 @@
-// context-ledger - mcp
-// Implementation pending — see context-ledger-design-v2.md
+// context-ledger — mcp
+// Barrel exports for the MCP tool registration module.
+
+export { registerReadTools } from "./read-tools.js";
+export { registerWriteTools } from "./write-tools.js";

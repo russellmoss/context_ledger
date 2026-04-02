@@ -1,0 +1,4 @@
+#!/bin/sh
+# context-ledger post-commit hook
+# Instantaneous, deterministic — zero LLM calls, zero network calls.
+node -e "import('context-ledger/dist/capture/hook.js').then(m => m.postCommit()).catch(() => {})" 2>/dev/null || true
