@@ -19,7 +19,10 @@
       "Bash(npx tsc:*)",
       "Bash(echo \"exit code: $?\")",
       "Bash(echo \"exit: $?\")",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ]
   }
 }
