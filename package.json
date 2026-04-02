@@ -1,5 +1,5 @@
 {
-  "name": "context-ledger",
+  "name": "@mossrussell/context-ledger",
   "version": "0.5.0",
   "description": "Decision capture and retrieval system for AI-assisted development",
   "type": "module",
