@@ -52,3 +52,21 @@ export {
   foldLedger,
   computeEffectiveRankScore,
 } from "./fold.js";
+
+export {
+  tidyInbox,
+  expireStaleItems,
+  getPendingItems,
+  updateInboxItem,
+} from "./inbox.js";
+
+export type {
+  ValidationReport,
+  RepairAction,
+  RepairPlan,
+} from "./validate.js";
+
+export {
+  validateLedger,
+  proposeRepair,
+} from "./validate.js";

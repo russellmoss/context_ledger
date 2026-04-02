@@ -15,9 +15,11 @@ import {
   LedgerIntegrityError, ledgerDir, ledgerPath, inboxPath, configPath,
   isDecisionRecord, isTransitionEvent,
   generateDecisionId, generateInboxId, appendToLedger, appendToInbox,
+  tidyInbox,
+  validateLedger, proposeRepair,
 } from "./ledger/index.js";
 import type {
-  FoldedDecision, MaterializedState, LifecycleState,
+  LifecycleState,
   DecisionRecord, InboxItem, EvidenceType, Durability,
 } from "./ledger/index.js";
 import { searchDecisions } from "./retrieval/index.js";
@@ -296,53 +298,33 @@ async function handleValidate(): Promise<void> {
   }
 
   const subcommand = args[1];
-  const issues: string[] = [];
-
-  // Council fix C6: Raw JSONL line-by-line check BEFORE folding
-  for (const [label, filePath] of [["ledger", ledgerPath(projectRoot)], ["inbox", inboxPath(projectRoot)]] as const) {
-    try {
-      const raw = await readFile(filePath, "utf8");
-      const lines = raw.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (line === "") continue;
-        try { JSON.parse(line); } catch {
-          issues.push(`Malformed JSON on line ${i + 1} of ${label}.jsonl`);
-        }
-      }
-    } catch (err: any) {
-      if (err.code !== "ENOENT") issues.push(`Cannot read ${label}: ${err.message}`);
-    }
-  }
-
-  // Run fold with strict: false to collect lifecycle warnings
-  const state = await foldLedger(projectRoot, { strict: false });
-  const inbox = await readInbox(projectRoot);
-  const decisions = Array.from(state.decisions.values());
-  issues.push(...state.warnings);
-
-  // Check for stale file references (D3: warnings only, not errors)
-  const warnings: string[] = [];
-  for (const d of decisions) {
-    if (d.state !== "active") continue;
-    for (const fp of d.record.affected_files) {
-      try {
-        await access(resolve(projectRoot, fp));
-      } catch {
-        warnings.push(`Stale file reference in ${d.record.id}: ${fp} does not exist`);
-      }
-    }
-  }
-
-  // Check inbox structural integrity
-  for (const item of inbox) {
-    if (!item.inbox_id || !item.status || !item.created) {
-      issues.push(`Malformed inbox item: missing required fields (id=${item.inbox_id})`);
-    }
-  }
 
   if (subcommand === "--propose-repair") {
-    return proposeRepair(state, issues, warnings);
+    const plan = await proposeRepair(projectRoot);
+    const { errors, warnings } = plan.report;
+
+    if (errors.length === 0 && warnings.length === 0 && plan.actions.length === 0) {
+      console.log("No issues or repair suggestions found.");
+      return;
+    }
+
+    if (errors.length > 0) {
+      console.log(`Issues (${errors.length}):`);
+      for (const e of errors) console.log(`  - ${e}`);
+      console.log("");
+    }
+
+    if (warnings.length > 0) {
+      console.log(`Warnings (${warnings.length}):`);
+      for (const w of warnings) console.log(`  - ${w}`);
+      console.log("");
+    }
+
+    if (plan.actions.length > 0) {
+      console.log(`Repair Suggestions (${plan.actions.length}):`);
+      for (const a of plan.actions) console.log(`  - ${a.type.toUpperCase()}: ${a.message}`);
+    }
+    return;
   }
 
   if (subcommand === "--apply-repair") {
@@ -351,80 +333,25 @@ async function handleValidate(): Promise<void> {
     process.exit(1);
   }
 
-  // Default: report issues and warnings separately
-  if (warnings.length > 0) {
-    console.log(`Warnings (${warnings.length}):`);
-    for (const w of warnings) console.log(`  - ${w}`);
+  // Default: validate and report
+  const report = await validateLedger(projectRoot);
+
+  if (report.warnings.length > 0) {
+    console.log(`Warnings (${report.warnings.length}):`);
+    for (const w of report.warnings) console.log(`  - ${w}`);
     console.log("");
   }
 
-  if (issues.length === 0) {
-    console.log(`Ledger integrity check passed.${warnings.length > 0 ? ` ${warnings.length} warning(s).` : " No issues found."}`);
+  if (report.passed) {
+    console.log(`Ledger integrity check passed.${report.warnings.length > 0 ? ` ${report.warnings.length} warning(s).` : " No issues found."}`);
     return;
   }
 
-  console.log(`Errors (${issues.length}):`);
-  for (const issue of issues) {
-    console.log(`  - ${issue}`);
+  console.log(`Errors (${report.errors.length}):`);
+  for (const e of report.errors) {
+    console.log(`  - ${e}`);
   }
   process.exit(1);
-}
-
-async function proposeRepair(state: MaterializedState, issues: string[], warnings: string[]): Promise<void> {
-  const decisions = Array.from(state.decisions.values());
-  const repairs: string[] = [];
-
-  // Near-duplicate detection: same scope + multiple active decisions
-  const activeByScope = new Map<string, FoldedDecision[]>();
-  for (const d of decisions) {
-    if (d.state !== "active") continue;
-    const scopeKey = `${d.record.scope.type}/${d.record.scope.id}`;
-    if (!activeByScope.has(scopeKey)) activeByScope.set(scopeKey, []);
-    activeByScope.get(scopeKey)!.push(d);
-  }
-
-  for (const [scopeKey, scopeDecisions] of activeByScope) {
-    if (scopeDecisions.length < 2) continue;
-    repairs.push(
-      `REVIEW: Scope "${scopeKey}" has ${scopeDecisions.length} active decisions: ${scopeDecisions.map(d => d.record.id).join(", ")}. Consider superseding duplicates.`
-    );
-  }
-
-  // Stale scope aliases
-  for (const d of decisions) {
-    if (d.state !== "active") continue;
-    for (const alias of d.record.scope_aliases) {
-      try {
-        await access(resolve(projectRoot, alias));
-      } catch {
-        repairs.push(
-          `UPDATE: Scope alias "${alias}" in ${d.record.id} no longer exists. Consider removing or updating.`
-        );
-      }
-    }
-  }
-
-  if (issues.length === 0 && warnings.length === 0 && repairs.length === 0) {
-    console.log("No issues or repair suggestions found.");
-    return;
-  }
-
-  if (issues.length > 0) {
-    console.log(`Issues (${issues.length}):`);
-    for (const issue of issues) console.log(`  - ${issue}`);
-    console.log("");
-  }
-
-  if (warnings.length > 0) {
-    console.log(`Warnings (${warnings.length}):`);
-    for (const w of warnings) console.log(`  - ${w}`);
-    console.log("");
-  }
-
-  if (repairs.length > 0) {
-    console.log(`Repair Suggestions (${repairs.length}):`);
-    for (const repair of repairs) console.log(`  - ${repair}`);
-  }
 }
 
 // ── init ──────────────────────────────────────────────────────────────────────
@@ -557,42 +484,14 @@ async function handleTidy(): Promise<void> {
     return;
   }
 
-  const inbox = await readInbox(projectRoot);
-  const now = Date.now();
-  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
-  const terminalStatuses = new Set(["dismissed", "expired", "ignored"]);
-
-  // First: mark pending items that should transition
-  const config = await loadConfig(projectRoot);
-  const processed = inbox.map((item) => {
-    if (item.status !== "pending") return item;
-    // Expire if past TTL
-    if (new Date(item.expires_after).getTime() < now) {
-      return { ...item, status: "expired" as const };
-    }
-    // Ignore if shown too many times
-    if (item.times_shown >= config.capture.inbox_max_prompts_per_item) {
-      return { ...item, status: "ignored" as const };
-    }
-    return item;
-  });
-
-  // Filter out terminal entries older than 30 days (D5: use created date)
-  const kept = processed.filter((item) => {
-    if (!terminalStatuses.has(item.status)) return true;
-    const age = now - new Date(item.created).getTime();
-    return age < thirtyDaysMs;
-  });
-
-  const removed = inbox.length - kept.length;
+  const { removed, remaining } = await tidyInbox(projectRoot);
 
   if (removed === 0) {
     console.log("No stale inbox entries to remove.");
     return;
   }
 
-  await rewriteInbox(kept, projectRoot);
-  console.log(`Removed ${removed} stale inbox entries. ${kept.length} entries remaining.`);
+  console.log(`Removed ${removed} stale inbox entries. ${remaining} entries remaining.`);
 }
 
 // ── backfill ──────────────────────────────────────────────────────────────────

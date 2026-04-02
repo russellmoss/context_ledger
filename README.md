@@ -239,18 +239,14 @@ npm install --save-dev @mossrussell/agent-guard @mossrussell/context-ledger coun
 
 Scope mappings let you give meaningful names to areas of your codebase. Without them, scope is derived from directory names. With them, `src/ledger/` maps to `domain/ledger-core` and queries become much more precise.
 
-The `CONTEXT_LEDGER_PROJECT_ROOT` environment variable can be used to override the default project root detection when the tool is run from outside the project directory.
+## Environment Variables
+
+The following environment variables can be used to configure context-ledger behavior:
+
+- `CONTEXT_LEDGER_PROJECT_ROOT`: Override the default project root detection when the tool is run from outside the project directory
+- `CONTEXT_LEDGER_DEBUG`: Enable verbose hook stderr output for debugging capture operations
 
 See `context-ledger-design-v2.md` for the full config schema and all options.
-
-## What's Coming
-
-The core loop (capture via MCP, store, fold, retrieve, CLI) is fully functional. These are still in progress:
-
-- **Post-commit hook automation** (`src/capture/`): Automatic change classification and inbox drafting on every commit. Currently a stub. The hook infrastructure is installed by `init`, but the classification logic is pending.
-- **Inbox management**: Dedicated inbox query and management tools. Currently handled through MCP write tools and `tidy`.
-
-These are enhancements to the capture pipeline. The decision storage, retrieval, and MCP interface are complete and production-ready.
 
 ## License
 
