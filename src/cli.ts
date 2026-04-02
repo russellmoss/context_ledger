@@ -474,7 +474,7 @@ async function installPostCommitHook(): Promise<void> {
   const hookScript = `#!/bin/sh
 # context-ledger post-commit hook
 # Instantaneous, deterministic — zero LLM calls, zero network calls.
-node -e "import('context-ledger/dist/capture/hook.js').then(m => m.postCommit()).catch(() => {})" 2>/dev/null || true
+node -e "import('@mossrussell/context-ledger/dist/capture/hook.js').then(m => m.postCommit()).catch(() => {})" 2>/dev/null || true
 `;
 
   // The line we check for to detect an existing context-ledger hook
@@ -507,7 +507,7 @@ node -e "import('context-ledger/dist/capture/hook.js').then(m => m.postCommit())
   try {
     await access(join(projectRoot, "lefthook.yml"));
     console.log("Lefthook detected. Add the following to your lefthook.yml:");
-    console.log('  post-commit:\n    commands:\n      context-ledger:\n        run: node -e "import(\'context-ledger/dist/capture/hook.js\').then(m => m.postCommit()).catch(() => {})"');
+    console.log('  post-commit:\n    commands:\n      context-ledger:\n        run: node -e "import(\'@mossrussell/context-ledger/dist/capture/hook.js\').then(m => m.postCommit()).catch(() => {})"');
     return;
   } catch { /* not lefthook */ }
 
@@ -516,7 +516,7 @@ node -e "import('context-ledger/dist/capture/hook.js').then(m => m.postCommit())
     const pkg = JSON.parse(await readFile(join(projectRoot, "package.json"), "utf8"));
     if (pkg["simple-git-hooks"]) {
       console.log("simple-git-hooks detected. Add to package.json:");
-      console.log('  "simple-git-hooks": { "post-commit": "node -e \\"import(\'context-ledger/dist/capture/hook.js\').then(m => m.postCommit()).catch(() => {})\\"" }');
+      console.log('  "simple-git-hooks": { "post-commit": "node -e \\"import(\'@mossrussell/context-ledger/dist/capture/hook.js\').then(m => m.postCommit()).catch(() => {})\\"" }');
       return;
     }
   } catch { /* ignore */ }
