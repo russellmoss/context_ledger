@@ -64,7 +64,7 @@ from 4 rounds of adversarial review.
 - **Deep Merge**: Hierarchical config loading with type-safe defaults
 - **Scope Mappings**: File path to scope derivation rules
 - **Feature Hints**: Query expansion mappings for retrieval
-- **Environment Variables**: Supports CONTEXT_LEDGER_PROJECT_ROOT for custom project root configuration
+- **Environment Variables**: Supports CONTEXT_LEDGER_PROJECT_ROOT for custom project root configuration, CONTEXT_LEDGER_DEBUG for verbose hook stderr output
 
 ## Ecosystem
 - agent-guard: Keeps the "what" accurate (inventories, doc sync, session context)
