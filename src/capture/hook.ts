@@ -222,7 +222,7 @@ export async function postCommit(): Promise<void> {
     // 6. Get changed files via single consolidated git command
     let raw: string;
     try {
-      raw = execSync("git diff-tree --root -r --name-status -z HEAD", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" });
+      raw = execSync("git diff-tree --no-commit-id --root -r --name-status -z HEAD", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" });
     } catch {
       debug("git diff-tree failed");
       return;

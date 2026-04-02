@@ -57,7 +57,7 @@ from 4 rounds of adversarial review.
 
 ### Capture System
 - **Classifier** (classify.ts): Deterministic commit classifier with 8 Tier 1 categories (dependency-addition, dependency-removal, env-var-change, new-directory, file-deletion, config-change, api-route-change, schema-change) and 4 Tier 2 categories (module-replacement, auth-security-change, db-migration-switch, feature-removal). Supports package.json content diff parsing for accurate dependency detection. 3-item cap per commit with Tier 2 priority.
-- **Hook** (hook.ts): Post-commit entry point executing under 100ms. Consolidated git diff-tree parsing with NUL-delimited output, merge commit skipping, path normalization, Tier 2 contradiction detection (best-effort with foldLedger size gate), redaction via config patterns, and append-only inbox writes. Debug output via CONTEXT_LEDGER_DEBUG env var.
+- **Hook** (hook.ts): Post-commit entry point executing under 100ms. Single `git diff-tree --no-commit-id --root -r --name-status -z HEAD` for NUL-delimited output parsing, merge commit skipping, path normalization, Tier 2 contradiction detection (best-effort with foldLedger size gate), redaction via config patterns, and append-only inbox writes. Debug output via CONTEXT_LEDGER_DEBUG env var.
 - **Exports** (index.ts): Barrel exports for ClassifyResult, ParsedPackageJson, classifyCommit, postCommit.
 
 ### Configuration System

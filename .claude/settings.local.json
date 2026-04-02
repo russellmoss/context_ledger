@@ -27,7 +27,8 @@
       "Bash(echo \"EXIT: $?\")",
       "Bash(npx agent-guard:*)",
       "Bash(npm run:*)",
-      "Bash(CONTEXT_LEDGER_DEBUG=1 node:*)"
+      "Bash(CONTEXT_LEDGER_DEBUG=1 node:*)",
+      "Bash(npx context-ledger:*)"
     ]
   }
 }
