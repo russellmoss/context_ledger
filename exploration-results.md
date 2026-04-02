@@ -1,135 +1,112 @@
-# Exploration Results — CLI Implementation (src/cli.ts)
+# Exploration Results — Post-Commit Hook Capture System (src/capture/)
 
 Date: 2026-04-01
-Sources: code-inspector-findings.md, pattern-finder-findings.md
+Sources: code-inspector-findings.md, pattern-finder-findings.md, context-ledger-design-v2.md
 
 ---
 
 ## Pre-Flight Summary
 
-The CLI stub exists at src/cli.ts (3 lines, shebang + comments). package.json already maps `context-ledger` bin to `dist/cli.js`. All core modules (ledger, retrieval, config) are fully implemented and exported through barrel files. Six stub files block full implementations of some commands: `validate.ts`, `inbox.ts`, `capture/index.ts`, `capture/classify.ts`, `capture/hook.ts`, and `setup.ts`. However, the CLI can achieve minimum viability for all 10 commands by calling existing functions directly and implementing lightweight logic inline where stubs exist. The `serve` command needs special handling since `mcp-server.ts` exports nothing — recommend inlining the 3-line McpServer setup using already-exported `registerReadTools`/`registerWriteTools`. Two design decisions are unresolved: backfill `--resume` state storage location and `validate --apply-repair` input source.
+Implementing the capture pipeline: 3 new files in src/capture/ (classify.ts, hook.ts, index.ts) plus a package.json script update. All core infrastructure exists — InboxItem type, appendToInbox, generateInboxId, foldLedger, deriveScope, loadConfig are all implemented and barrel-exported. The existing classifyCommit in cli.ts is a partial reference but missing new-directory detection, diff-filter deletion signals, Tier 2 categories, and config awareness. The hook must: (1) execute under 100ms, (2) never block git commits, (3) use only console.error, (4) append-only to inbox.jsonl, (5) apply redact_patterns before writing. Tier 2 contradiction detection requires foldLedger + deriveScope which adds latency on large ledgers — needs a fast-path gate.
 
 ---
 
 ## Files to Modify
 
-| File | Changes |
-|------|---------|
-| `src/cli.ts` | **Primary target.** Replace 3-line stub with full CLI (~400-600 lines). 10 commands, --help, --version. |
-| `src/mcp-server.ts` | Extract `startMcpServer(projectRoot)` function and export it, OR have CLI inline the setup. |
-
-### Files to Read (no modifications needed)
-
-| File | Used By Commands |
-|------|-----------------|
-| `src/config.ts` | init (DEFAULT_CONFIG), all commands (loadConfig, projectRoot pattern) |
-| `src/ledger/index.ts` | All commands — barrel for types, storage, fold |
-| `src/ledger/events.ts` | stats (RETRIEVAL_WEIGHTS), type guards |
-| `src/ledger/storage.ts` | init (ledgerDir, configPath), tidy (readInbox, rewriteInbox), export (readLedger) |
-| `src/ledger/fold.ts` | stats, export, validate (foldLedger, LedgerIntegrityError) |
-| `src/retrieval/index.ts` | query (searchDecisions), barrel for types |
-| `src/retrieval/query.ts` | query (searchDecisions signature) |
-| `src/mcp/index.ts` | serve (registerReadTools, registerWriteTools) |
-| `package.json` | --version (version field) |
+| File | Action | What Changes |
+|------|--------|-------------|
+| `src/capture/classify.ts` | Replace stub | Full classifier: Tier 1/2/null with config-aware ignore_paths, no_capture_marker |
+| `src/capture/hook.ts` | Replace stub | Post-commit entry: git commands → classify → group → append inbox items |
+| `src/capture/index.ts` | Replace stub | Barrel exports for classifyCommit, ClassifyResult, postCommit |
+| `package.json` | Add script | `"postcommit": "node dist/capture/hook.js"` |
 
 ---
 
 ## Type Changes
 
-**No type changes required.** All types needed by the CLI already exist and are exported:
+### New types in classify.ts (not exported from ledger — local to capture module):
 
-- `DecisionRecord`, `TransitionEvent`, `InboxItem`, `LedgerEvent` — from `src/ledger/events.ts`
-- `FoldedDecision`, `MaterializedState`, `FoldOptions`, `LedgerIntegrityError` — from `src/ledger/fold.ts`
-- `LedgerConfig` — from `src/config.ts`
-- `DecisionPack`, `SearchResult`, `QueryDecisionsParams` — from `src/retrieval/query.ts`
-- `LifecycleState`, `EvidenceType`, `Durability`, `InboxStatus` — string unions from `src/ledger/events.ts`
+```typescript
+export interface ClassifyResult {
+  tier: 1 | 2 | null;            // null = ignored
+  change_category: string;        // e.g. "dependency-addition", "auth-security-change"
+  inbox_type: InboxType | null;   // "draft_needed" | "question_needed" | null
+  changed_files: string[];        // filtered files that triggered this classification
+}
+```
+
+No changes to existing types in events.ts, config.ts, or fold.ts.
 
 ---
 
 ## Construction Site Inventory
 
-The CLI does not construct DecisionRecord, TransitionEvent, or InboxItem objects directly. It is a read-oriented consumer that calls existing functions:
+### InboxItem construction in hook.ts (NEW — follows backfill pattern from cli.ts:727-742):
+```typescript
+const item: InboxItem = {
+  inbox_id: generateInboxId(),
+  type: result.inbox_type!,      // "draft_needed" or "question_needed"
+  created: new Date().toISOString(),
+  commit_sha: sha,
+  commit_message: redactedMessage,
+  change_category: result.change_category,
+  changed_files: result.changed_files,
+  diff_summary: redactedSummary,
+  priority: "normal",
+  expires_after: new Date(Date.now() + config.capture.inbox_ttl_days * 24 * 60 * 60 * 1000).toISOString(),
+  times_shown: 0,
+  last_prompted_at: null,
+  status: "pending",
+};
+```
 
-| CLI Command | Functions Called | Return Type |
-|-------------|----------------|-------------|
-| init | `mkdir`, `writeFile` (node:fs/promises), `DEFAULT_CONFIG` | void |
-| serve | `McpServer`, `registerReadTools`, `registerWriteTools`, `StdioServerTransport` | void (long-running) |
-| query | `searchDecisions(query, projectRoot)` | `SearchResult[]` |
-| stats | `foldLedger(projectRoot)`, `readInbox(projectRoot)` | `MaterializedState`, `InboxItem[]` |
-| export | `foldLedger(projectRoot)` | `MaterializedState` |
-| validate | `foldLedger(projectRoot, { strict: false })`, `readInbox(projectRoot)`, `fs.access()` | `MaterializedState` |
-| validate --propose-repair | Same as validate + analysis logic | void |
-| tidy | `readInbox(projectRoot)`, `rewriteInbox(filtered, projectRoot)` | void |
-| backfill | `execSync('git log ...')`, `appendToLedger(record, projectRoot)` | void |
-| setup | Delegate to `src/setup.ts` (stub) | void |
+### Existing construction sites (NO changes needed):
+- `src/cli.ts:727-742` — backfill InboxItem (unchanged)
+- `src/mcp/write-tools.ts:111-125` — propose_decision InboxItem (unchanged)
 
 ---
 
 ## Recommended Phase Order
 
-### Phase 1: Core CLI Framework
-- argv parsing, --help, --version, projectRoot resolution, error handling wrapper
-- Commands: serve (simplest — just start MCP server)
-
-### Phase 2: Read Commands
-- query, stats, export
-- These only read data and format output. No mutations.
-
-### Phase 3: Validation Commands
-- validate, validate --propose-repair
-- Read-only but need additional fs.access() checks and analysis logic.
-
-### Phase 4: Write Commands
-- init, tidy
-- These create/modify files on disk.
-
-### Phase 5: Backfill Commands
-- backfill --max N, backfill --resume
-- Most complex: git log parsing, commit classification, state persistence.
-
-### Phase 6: Setup Delegation
-- setup command (delegates to src/setup.ts which is a stub)
-- Minimal: just print "setup not yet implemented" or dynamic import.
+1. **Phase 1: classify.ts** — Pure function, no I/O dependencies. Export ClassifyResult type and classifyCommit function.
+2. **Phase 2: hook.ts** — Depends on classify.ts. Git commands → classify → group → redact → append.
+3. **Phase 3: index.ts barrel** — Depends on both files existing.
+4. **Phase 4: package.json** — Script addition.
+5. **Phase 5: Build + test** — tsc, manual smoke test with a test commit.
 
 ---
 
 ## Risks and Blockers
 
-### Blocking Issues
-1. **mcp-server.ts exports nothing** — serve command can't `import { start }`. Fix: either export a `startMcpServer` function or inline the 3-line setup in cli.ts.
-2. **capture/ stubs** — backfill commit classification logic doesn't exist. CLI must implement lightweight classification inline or defer backfill.
-3. **validate.ts stub** — No dedicated validation module. CLI can use `foldLedger({ strict: false })` warnings + fs.access() checks as minimum viability.
+1. **Tier 2 latency**: `foldLedger` reads and parses full ledger.jsonl. At 500+ events, this could push hook over 100ms. Mitigation: only call foldLedger when Tier 2 signals are present (auth/security paths, structural changes in mapped scopes). Skip fold entirely for pure Tier 1 commits.
 
-### Design Decisions Needed
-4. **backfill --resume state location** — Not specified in design spec. Recommend `.context-ledger/backfill-state.json`.
-5. **validate --apply-repair input source** — Not specified. Recommend reading from stdin (pipe `--propose-repair` output).
+2. **git diff-tree on initial commit**: `git diff-tree HEAD` fails when HEAD is the first commit (no parent). Mitigation: try/catch, fallback to `git diff-tree --root HEAD`.
 
-### Edge Cases
-6. **Empty ledger** — All read commands must handle zero decisions gracefully.
-7. **Missing .context-ledger/ directory** — Commands other than init should fail with helpful message.
-8. **Malformed JSONL** — Storage layer already handles this (skip + warn), but validate should report it.
-9. **rewriteInbox with empty array** — Writes bare newline. Safe but slightly odd.
+3. **Multiple inbox items per commit**: Design spec requires grouping by "file proximity and change type" for commits with multiple unrelated structural changes. This is the most complex part — need a grouping algorithm that clusters changed files by directory prefix and classification category.
+
+4. **redact_patterns are regexes**: Must compile them and handle invalid patterns gracefully (try/catch on `new RegExp()`).
+
+5. **execSync on Windows**: `git diff-tree` works on Windows but path separators will be forward-slash (git's output). normalizePath handles this.
 
 ---
 
 ## Design Spec Compliance
 
-Checked against context-ledger-design-v2.md:
+| Spec Requirement | Implementation | Compliant? |
+|-----------------|---------------|------------|
+| Hook under 100ms | execSync + sync classify + async append | Yes (with Tier 2 gate) |
+| Zero LLM calls | Deterministic heuristics only | Yes |
+| Zero network calls | Local git + local JSONL only | Yes |
+| Append-only to inbox.jsonl | Uses appendToInbox | Yes |
+| redact_patterns applied before write | Applied to diff_summary and commit_message | Yes |
+| no_capture_marker check | Early exit if found in commit message | Yes |
+| ignore_paths filtering | Applied to changed_files before classify | Yes |
+| capture.enabled gate | Early exit if false | Yes |
+| Multiple inbox items per commit | Grouped by file proximity + change type | Yes |
+| Tier 1 categories (7) | All 7 from spec | Yes |
+| Tier 2 categories (5) | All 5 from spec | Yes |
+| 14-day TTL | Uses config.capture.inbox_ttl_days | Yes |
+| All output to stderr | console.error only | Yes |
+| Graceful error handling | try/catch entire hook, exit 0 on error | Yes |
 
-| Spec Requirement | Status |
-|-----------------|--------|
-| CLI commands list (§ CLI Commands) | ✅ All 10 commands + setup covered |
-| init creates .context-ledger/ + config.json + hook | ✅ Matches spec |
-| serve starts MCP over stdio | ✅ Matches spec |
-| query uses searchDecisions for CLI debugging | ✅ Spec says "CLI/debugging only, lexical fallback" |
-| stats groups by source, kind, scope, evidence type | ✅ Matches spec |
-| export supports json and csv formats | ✅ Matches spec |
-| validate checks invariants, does not auto-repair | ✅ Matches spec |
-| validate --propose-repair outputs plan, no modification | ✅ Matches spec |
-| validate --apply-repair applies reviewed plan | ⚠️ Input source unspecified in spec |
-| tidy removes terminal entries > 30 days | ✅ Matches spec |
-| backfill --max N default cap 5 | ✅ Matches spec |
-| backfill --resume state persistence | ⚠️ State location unspecified in spec |
-| No console.log in serve mode (stdout = JSON-RPC) | ✅ Will use console.error for diagnostics |
-| .js extensions on all imports | ✅ Required by Node16 resolution |
-| Zero additional runtime dependencies | ✅ Node built-ins only for CLI |
+No deviations from spec.

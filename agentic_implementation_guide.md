@@ -1,1133 +1,677 @@
-# Agentic Implementation Guide — CLI (src/cli.ts)
+# Agentic Implementation Guide — Post-Commit Hook Capture System (src/capture/)
 
-**Feature:** Full CLI implementation — 10 commands, --help, --version, Node built-ins only
-**Spec:** context-ledger-design-v2.md
+**Feature:** Deterministic post-commit hook classifier + inbox writer
+**Spec:** context-ledger-design-v2.md (Capture: Two Tiers, Security and Redaction sections)
 **Exploration:** exploration-results.md, code-inspector-findings.md, pattern-finder-findings.md
+**Council Review:** council-feedback.md — all Bucket 1 fixes applied
+**Human Input:** All 6 Bucket 2 questions answered and applied
 
 ---
 
 ## Pre-Implementation Checklist
 
 Before starting, verify:
+
 ```bash
-# Build succeeds with current code
+# 1. Build passes clean
 npx tsc --noEmit
 
-# Core modules are functional
-node -e "import('./dist/ledger/index.js').then(m => console.log('ledger OK'))"
-node -e "import('./dist/retrieval/index.js').then(m => console.log('retrieval OK'))"
-node -e "import('./dist/config.js').then(m => console.log('config OK'))"
+# 2. Stub files exist
+ls src/capture/classify.ts src/capture/hook.ts src/capture/index.ts
+
+# 3. Core dependencies are implemented
+grep -c "appendToInbox" src/ledger/storage.ts    # expect >= 1
+grep -c "generateInboxId" src/ledger/events.ts   # expect >= 1
+grep -c "foldLedger" src/ledger/fold.ts           # expect >= 1
+grep -c "deriveScope" src/retrieval/scope.ts      # expect >= 1
+grep -c "loadConfig" src/config.ts                # expect >= 1
 ```
+
+If build fails or any dependency is missing, fix before proceeding.
 
 ---
 
-## Phase 1: Core CLI Framework + Serve Command
+## Phase 1: Classifier (src/capture/classify.ts)
 
-**Files:** `src/cli.ts`, `src/mcp-server.ts`
+### What to build
+A pure function that classifies a commit into Tier 1 (draft_needed) or Tier 2 (question_needed) based on deterministic heuristics and config. Returns only actionable results — empty array for ignored commits. Zero I/O, zero LLM calls.
 
-### Step 1.1: Extract startMcpServer from mcp-server.ts
+### File: `src/capture/classify.ts`
 
-In `src/mcp-server.ts`, refactor the top-level code into an exported `startMcpServer(projectRoot: string)` function so the CLI can call it. Keep the existing self-running behavior for the `context-ledger-mcp` bin entry.
+Replace the 2-line stub entirely.
 
-The file currently has top-level `const server = new McpServer(...)` at line 11. Wrap lines 11-23 into:
+### Exports
 
 ```typescript
-export async function startMcpServer(projectRoot: string): Promise<void> {
-  const server = new McpServer({ name: "context-ledger", version: "0.1.0" });
-  registerReadTools(server, projectRoot);
-  registerWriteTools(server, projectRoot);
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("[context-ledger] MCP server running on stdio");
+export interface ClassifyResult {
+  tier: 1 | 2;
+  change_category: string;
+  inbox_type: "draft_needed" | "question_needed";
+  changed_files: string[];
 }
+
+export interface ParsedPackageJson {
+  addedDeps: string[];     // e.g. ["@google/genai@^1.46.0"]
+  removedDeps: string[];   // e.g. ["old-lib"]
+  otherChanges: boolean;   // true if scripts/version/etc changed but no dep changes
+}
+
+export function classifyCommit(
+  changedFiles: string[],
+  deletedFiles: string[],
+  addedFiles: string[],
+  commitMessage: string,
+  config: LedgerConfig,
+  packageJsonDiff?: ParsedPackageJson | null,
+): ClassifyResult[];
 ```
 
-Remove all self-execution code from `mcp-server.ts`. It should only export `startMcpServer`.
+Note: Returns an **array** of ClassifyResult — one per detected change cluster. The design spec (v2.1) requires multiple inbox items per commit for unrelated structural changes. Returns empty array `[]` for ignored commits — no null tiers or null inbox_types in results.
 
-Then create a new file `src/mcp-server-bin.ts` — the thin bin entry for `context-ledger-mcp`:
+### Imports
 
 ```typescript
-#!/usr/bin/env node
-// context-ledger-mcp — standalone MCP server bin entry
-import { startMcpServer } from "./mcp-server.js";
-
-const projectRoot = process.env.CONTEXT_LEDGER_PROJECT_ROOT ?? process.cwd();
-startMcpServer(projectRoot).catch((error) => {
-  console.error("[context-ledger] Fatal error:", error);
-  process.exit(1);
-});
+import type { LedgerConfig } from "../config.js";
 ```
 
-Update `package.json` bin entry to point `context-ledger-mcp` at `dist/mcp-server-bin.js` instead of `dist/mcp-server.js`.
+### Classification Logic
 
-**Council fix C4:** This eliminates the brittle `argv[1]` guard entirely. No symlink/npx/runtime issues.
+**Path normalization (apply first to ALL file arrays):**
+Replace `\` with `/`, strip leading `./`, lowercase for matching. Preserve original paths in `changed_files` output.
 
-### Step 1.2: Implement CLI framework in src/cli.ts
+**Early exits (return `[]`):**
+1. `config.capture.enabled === false`
+2. No files after filtering (empty commit or all ignored)
 
-Replace the 3-line stub with the full CLI. Structure:
+Note: `no_capture_marker` check happens in hook.ts before calling classifyCommit, using the full commit body (`%B`), not just subject.
+
+**Filter changed files:**
+Remove any file whose normalized path starts with any entry in `config.capture.ignore_paths`. Apply to all three arrays (changedFiles, addedFiles, deletedFiles).
+
+**Ignored patterns (return `[]` if ALL remaining files match):**
+- Test files: `*.test.*`, `*.spec.*`, `__tests__/`, `__mocks__/` — UNLESS addedFiles include a new test directory
+- Documentation: `*.md`, `docs/`, `README*`, `LICENSE*`, `CHANGELOG*`
+- Style/formatting: `.css`, `.scss`, `.less`, `styles/`, `.prettierrc` (config-change takes priority over style-ignore)
+
+**Tier 2 triggers (check FIRST — Tier 2 takes priority):**
+
+| Category | Detection |
+|----------|-----------|
+| `"module-replacement"` | deletedFiles in one directory AND addedFiles in a different directory at same depth, both containing implementation files (not tests/docs) |
+| `"auth-security-change"` | Any file path contains `auth/`, `middleware/`, `permissions/`, `security/`, or filename contains `credentials`, `oauth`, `jwt`, `session` |
+| `"db-migration-switch"` | deletedFiles contain migration/schema tool files AND addedFiles contain different migration/schema tool files (e.g., prisma→drizzle) |
+| `"feature-removal"` | 3+ non-test non-doc files deleted from same directory |
+
+**Tier 1 triggers:**
+
+| Category | Detection |
+|----------|-----------|
+| `"dependency-addition"` | `package.json` in changedFiles — hook.ts parses content diff to detect new deps in dependencies/devDependencies |
+| `"dependency-removal"` | `package.json` in changedFiles — hook.ts parses content diff to detect removed deps |
+| `"dependency-change"` | `package.json` in changedFiles but no dependency add/remove detected (script change, version bump, etc.) — classify as Tier 1 only if other structural signals present, otherwise IGNORE |
+| `"env-var-change"` | `.env.example` or `.env.local.example` in changedFiles |
+| `"new-directory"` | addedFiles have 2+ files sharing a parent directory that has no files in changedFiles (only added) |
+| `"file-deletion"` | deletedFiles has non-test non-doc files (and not already caught by Tier 2 feature-removal) |
+| `"config-change"` | Any file matching `/tsconfig|eslint|\.prettierrc|jest\.config|vitest\.config|\.github\/workflows/` |
+| `"api-route-change"` | Any file matching `src/app/api/`, `src/pages/api/`, `src/routes/`, or new `page.tsx`/`page.ts` in a route directory |
+| `"schema-change"` | Any file matching `schema`, `migration`, `.prisma`, `.sql`, `drizzle` |
+
+**Grouping logic:**
+1. First classify ALL files into their categories (a file may match multiple)
+2. For each category, group files by nearest common ancestor directory
+3. Emit one ClassifyResult per (category, directory-group) pair
+4. Sort and deduplicate `changed_files` within each result
+5. **Cap at 3 results per commit.** Priority: Tier 2 first, then Tier 1 sorted by structural signal strength (more files = stronger signal). If items are dropped, log to stderr: `[context-ledger] Capped at 3 inbox items (dropped N lower-priority classifications)`
+
+### Validation Gate
+
+```bash
+npx tsc --noEmit 2>&1 | head -20
+# Expected: errors only in hook.ts and index.ts (stubs importing from classify)
+# classify.ts itself should compile clean
+```
+
+### STOP AND REPORT
+Show: (1) ClassifyResult type definition, (2) Number of Tier 1 categories, (3) Number of Tier 2 categories, (4) Compile errors remaining.
+
+---
+
+## Phase 2: Post-Commit Hook (src/capture/hook.ts)
+
+### What to build
+The hook entry point. Gets git diff metadata, classifies, redacts, and appends inbox items. Must complete under 100ms. Never blocks a git commit. All output to stderr.
+
+### File: `src/capture/hook.ts`
+
+Replace the 2-line stub entirely.
+
+### Exports
 
 ```typescript
-#!/usr/bin/env node
-// context-ledger — CLI entry point
-// All command output goes to stdout. Diagnostics and errors to stderr.
+export async function postCommit(): Promise<void>
+```
 
-import { readFile, mkdir, writeFile, access, unlink } from "node:fs/promises";
-import { join, resolve } from "node:path";
+### Imports
+
+```typescript
 import { execSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
-
-// Internal imports — all .js extensions
-import { DEFAULT_CONFIG, loadConfig } from "./config.js";
-import {
-  readLedger, readInbox, rewriteInbox, foldLedger,
-  LedgerIntegrityError, ledgerDir, configPath,
-  isDecisionRecord, isTransitionEvent,
-  generateDecisionId, appendToLedger,
-} from "./ledger/index.js";
-import type {
-  FoldedDecision, MaterializedState, LifecycleState,
-  DecisionRecord, InboxItem, EvidenceType, Durability,
-} from "./ledger/index.js";
-import { searchDecisions } from "./retrieval/index.js";
-import type { SearchResult } from "./retrieval/index.js";
-import { startMcpServer } from "./mcp-server.js";
+import type { InboxItem, FoldedDecision } from "../ledger/index.js";
+import { generateInboxId, appendToInbox, foldLedger } from "../ledger/index.js";
+import type { LedgerConfig } from "../config.js";
+import { loadConfig } from "../config.js";
+import { deriveScope } from "../retrieval/index.js";
+import { classifyCommit } from "./classify.js";
+import type { ClassifyResult, ParsedPackageJson } from "./classify.js";
 ```
 
-**projectRoot resolution** (must match mcp-server.ts pattern):
+### Helper: buildInboxItem
+
+Centralize InboxItem construction to prevent schema drift (Council fix I2):
+
 ```typescript
-const projectRoot = process.env.CONTEXT_LEDGER_PROJECT_ROOT ?? process.cwd();
+function buildInboxItem(
+  result: ClassifyResult,
+  sha: string,
+  redactedMessage: string,
+  diffSummary: string,
+  config: LedgerConfig,
+): InboxItem {
+  return {
+    inbox_id: generateInboxId(),
+    type: result.inbox_type,
+    created: new Date().toISOString(),
+    commit_sha: sha,
+    commit_message: redactedMessage,
+    change_category: result.change_category,
+    changed_files: [...result.changed_files].sort(),
+    diff_summary: diffSummary,
+    priority: "normal",
+    expires_after: new Date(Date.now() + config.capture.inbox_ttl_days * 24 * 60 * 60 * 1000).toISOString(),
+    times_shown: 0,
+    last_prompted_at: null,
+    status: "pending",
+  };
+}
 ```
 
-**Argv parsing** — manual, no dependencies:
-```typescript
-const args = process.argv.slice(2);
-const command = args[0];
+### Helper: redact
 
-// Council fix S3: Helper to parse --flag value AND --flag=value
-function getFlag(flag: string): string | undefined {
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === flag && i + 1 < args.length) return args[i + 1];
-    if (args[i].startsWith(flag + "=")) return args[i].slice(flag.length + 1);
+```typescript
+function redact(text: string, patterns: string[]): string {
+  let result = text;
+  for (const pat of patterns) {
+    try {
+      result = result.replace(new RegExp(pat, "g"), "[REDACTED]");
+    } catch { /* invalid regex — skip */ }
   }
-  return undefined;
-}
-
-function hasFlag(flag: string): boolean {
-  return args.includes(flag);
+  return result;
 }
 ```
 
-**Command dispatch:**
+### Helper: buildDiffSummary
+
+Build a brief human-readable summary. For package.json and .env.example, extract specific facts (dep names, env var names). For everything else, category + file counts.
+
 ```typescript
-async function main(): Promise<void> {
-  switch (command) {
-    case "init": return handleInit();
-    case "serve": return handleServe();
-    case "query": return handleQuery();
-    case "stats": return handleStats();
-    case "export": return handleExport();
-    case "validate": return handleValidate();
-    case "tidy": return handleTidy();
-    case "backfill": return handleBackfill();
-    case "setup": return handleSetup();
-    case "--help": case "-h": return printHelp();
-    case "--version": case "-v": return printVersion();
-    default:
-      if (!command) { printHelp(); return; }
-      console.error(`Unknown command: ${command}`);
-      printHelp();
-      process.exit(1);
+function buildDiffSummary(result: ClassifyResult, extras?: { packageJsonDiff?: ParsedPackageJson | null; envVarChanges?: string[] | null }): string {
+  // Specific facts for the two most common structural changes
+  if (result.change_category === "dependency-addition" && extras?.packageJsonDiff?.addedDeps.length) {
+    return `dependency-addition: +${extras.packageJsonDiff.addedDeps.join(", +")}`;
   }
+  if (result.change_category === "dependency-removal" && extras?.packageJsonDiff?.removedDeps.length) {
+    return `dependency-removal: -${extras.packageJsonDiff.removedDeps.join(", -")}`;
+  }
+  if (result.change_category === "env-var-change" && extras?.envVarChanges?.length) {
+    return `env-var-change: ${extras.envVarChanges.join(", ")}`;
+  }
+
+  // Generic: category + file counts
+  const files = result.changed_files;
+  if (files.length === 1) return `${result.change_category}: ${files[0]}`;
+  const dirs = [...new Set(files.map(f => f.split("/").slice(0, -1).join("/")))];
+  if (dirs.length === 1) return `${result.change_category}: ${files.length} files in ${dirs[0]}/`;
+  return `${result.change_category}: ${files.length} files across ${dirs.length} directories`;
 }
 ```
 
-**Pre-flight check for commands that need the ledger directory (Council fix S4):**
-```typescript
-const NEEDS_LEDGER = new Set(["query", "stats", "export", "validate", "tidy", "backfill"]);
+### Helper: parsePackageJsonDiff
 
-async function ensureLedgerExists(): Promise<void> {
-  if (!NEEDS_LEDGER.has(command)) return;
+Parse `git show` output to detect dependency additions/removals (~20ms, worth it for accuracy):
+
+```typescript
+function parsePackageJsonDiff(projectRoot: string): ParsedPackageJson | null {
   try {
-    await access(ledgerDir(projectRoot));
+    const current = JSON.parse(execSync("git show HEAD:package.json", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" }));
+    let previous: any = {};
+    try {
+      previous = JSON.parse(execSync("git show HEAD~1:package.json", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" }));
+    } catch { /* initial commit or file didn't exist */ }
+
+    const currentDeps = { ...current.dependencies, ...current.devDependencies };
+    const prevDeps = { ...previous.dependencies, ...previous.devDependencies };
+
+    const addedDeps: string[] = [];
+    const removedDeps: string[] = [];
+
+    for (const [name, version] of Object.entries(currentDeps)) {
+      if (!(name in prevDeps)) addedDeps.push(`${name}@${version}`);
+    }
+    for (const name of Object.keys(prevDeps)) {
+      if (!(name in currentDeps)) removedDeps.push(name);
+    }
+
+    const otherChanges = JSON.stringify(current) !== JSON.stringify(previous) && addedDeps.length === 0 && removedDeps.length === 0;
+    return { addedDeps, removedDeps, otherChanges };
   } catch {
-    console.error("Error: .context-ledger/ directory not found.");
-    console.error("Run 'context-ledger init' to initialize.");
-    process.exit(1);
+    return null;
   }
 }
 ```
 
-Call `await ensureLedgerExists()` at the top of `main()` before the switch statement.
+### Helper: parseEnvChanges
 
-**Error wrapper:**
-```typescript
-main().catch((err) => {
-  console.error(`Error: ${err.message}`);
-  process.exit(1);
-});
-```
-
-### Step 1.3: Implement --help and --version
-
-**--version:** Read from package.json using `fileURLToPath` + `import.meta.url`:
-```typescript
-async function printVersion(): Promise<void> {
-  const __dirname = fileURLToPath(new URL(".", import.meta.url));
-  const pkgPath = join(__dirname, "..", "package.json");
-  const pkg = JSON.parse(await readFile(pkgPath, "utf8"));
-  console.log(`context-ledger v${pkg.version}`);
-}
-```
-
-**--help:** Static text listing all commands (Council fix S1: --apply-repair marked):
-```
-Usage: context-ledger <command> [options]
-
-Commands:
-  init                          Create .context-ledger/ and install hook
-  serve                         Start MCP server over stdio
-  query <text>                  Search decisions (lexical, active only)
-  stats                         Show decision and inbox statistics
-  export --format json|csv|jsonl Export decisions to stdout
-  validate                      Check ledger integrity
-  validate --propose-repair     Suggest repairs without modifying files
-  validate --apply-repair       Apply repair plan (not yet implemented)
-  tidy                          Remove stale inbox entries (>30 days)
-  backfill --max <N>            Backfill from git history (default 5)
-  backfill --resume             Resume interrupted backfill
-  setup                         Run interactive setup wizard
-
-Options:
-  --help, -h                    Show this help
-  --version, -v                 Show version
-
-Use 'context-ledger <command> --help' for command-specific help.
-```
-
-**Sub-command help (Council fix S7):** In the main switch, before dispatching each command, check if `args.includes("--help")`. If so, print command-specific usage and return. Example for export:
-```
-Usage: context-ledger export --format <json|csv>
-  --format json    Output materialized decisions as JSON array
-  --format csv     Output decisions as CSV with header row
-```
-
-### Step 1.4: Implement serve command
+Parse .env.example diff to extract changed variable names (~5ms):
 
 ```typescript
-async function handleServe(): Promise<void> {
-  await startMcpServer(projectRoot);
+function parseEnvChanges(projectRoot: string): string[] | null {
+  try {
+    const current = execSync("git show HEAD:.env.example", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" });
+    let previous = "";
+    try {
+      previous = execSync("git show HEAD~1:.env.example", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" });
+    } catch { /* file didn't exist before */ }
+
+    const parseVars = (text: string) => text.split("\n").filter(l => l.includes("=") && !l.startsWith("#")).map(l => l.split("=")[0].trim());
+    const currentVars = new Set(parseVars(current));
+    const prevVars = new Set(parseVars(previous));
+
+    const changes: string[] = [];
+    for (const v of currentVars) if (!prevVars.has(v)) changes.push(`+${v}`);
+    for (const v of prevVars) if (!currentVars.has(v)) changes.push(`-${v}`);
+    return changes.length > 0 ? changes : null;
+  } catch {
+    return null;
+  }
 }
 ```
 
-### Validation Gate — Phase 1
-
-```bash
-# Build
-npx tsc --noEmit
-
-# --help works
-node dist/cli.js --help
-
-# --version works
-node dist/cli.js --version
-
-# serve starts (test by running and pressing Ctrl+C)
-# Note: serve locks stdout for JSON-RPC, just verify it starts without error
-```
-
-**STOP AND REPORT:** Phase 1 complete. Verify --help, --version, serve work. Then proceed.
-
----
-
-## Phase 2: Read Commands (query, stats, export)
-
-**Files:** `src/cli.ts` (append handlers)
-
-### Step 2.1: query command
+### Helper: isMergeCommit
 
 ```typescript
-async function handleQuery(): Promise<void> {
-  const queryText = args.slice(1).join(" ");
-  if (!queryText) {
-    console.error("Usage: context-ledger query <text>");
-    process.exit(1);
-  }
-
-  const results = await searchDecisions(queryText, projectRoot);
-
-  if (results.length === 0) {
-    console.log("No matching decisions found.");
-    return;
-  }
-
-  console.log(`Found ${results.length} decision(s):\n`);
-  for (const r of results) {
-    console.log(`  ${r.record.id}  [${r.state}]  score=${r.effective_rank_score.toFixed(2)}`);
-    console.log(`    ${r.record.summary}`);
-    console.log(`    scope: ${r.record.scope.type}/${r.record.scope.id}`);
-    console.log(`    kind: ${r.record.decision_kind}  durability: ${r.record.durability}`);
-    console.log("");
+function isMergeCommit(projectRoot: string): boolean {
+  try {
+    execSync("git rev-parse HEAD^2", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
   }
 }
 ```
 
-### Step 2.2: stats command
+### Helper: parseNameStatus
+
+Parse `git diff-tree -z --name-status` output into categorized file arrays (Council fix I1):
 
 ```typescript
-async function handleStats(): Promise<void> {
-  const state = await foldLedger(projectRoot);
-  const inbox = await readInbox(projectRoot);
-
-  const decisions = Array.from(state.decisions.values());
-  const total = decisions.length;
-
-  if (total === 0 && inbox.length === 0) {
-    console.log("No decisions or inbox items found.");
-    return;
-  }
-
-  // Spec-mandated groupings: source, kind, scope, evidence type, verification status
-  const bySource = countBy(decisions, (d) => d.record.source);
-  const byKind = countBy(decisions, (d) => d.record.decision_kind);
-  const byScope = countBy(decisions, (d) => `${d.record.scope.type}/${d.record.scope.id}`);
-  const byEvidence = countBy(decisions, (d) => d.record.evidence_type);
-  const byVerification = countBy(decisions, (d) => d.record.verification_status);
-  // Bonus groupings (useful but not spec-required)
-  const byState = countBy(decisions, (d) => d.state);
-  const byDurability = countBy(decisions, (d) => d.record.durability);
-
-  console.log(`Decisions: ${total} total\n`);
-  printSection("By Source", bySource);
-  printSection("By Decision Kind", byKind);
-  printSection("By Scope", byScope);
-  printSection("By Evidence Type", byEvidence);
-  printSection("By Verification Status", byVerification);
-  printSection("By State", byState);
-  printSection("By Durability", byDurability);
-
-  // Inbox summary
-  const byInboxStatus = countBy(inbox, (i) => i.status);
-  console.log(`\nInbox: ${inbox.length} total`);
-  printSection("By Status", byInboxStatus);
+interface ParsedDiff {
+  all: string[];
+  added: string[];
+  deleted: string[];
+  modified: string[];
+  renamed: Array<{ from: string; to: string }>;
 }
 
-// Utility: count occurrences by key extractor
-function countBy<T>(items: T[], keyFn: (item: T) => string): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const item of items) {
-    const key = keyFn(item);
-    counts.set(key, (counts.get(key) ?? 0) + 1);
-  }
-  return counts;
-}
-
-function printSection(title: string, counts: Map<string, number>): void {
-  console.log(`  ${title}:`);
-  for (const [key, count] of [...counts.entries()].sort((a, b) => b[1] - a[1])) {
-    console.log(`    ${key}: ${count}`);
-  }
-}
-```
-
-### Step 2.3: export command
-
-```typescript
-async function handleExport(): Promise<void> {
-  const format = getFlag("--format");
-
-  if (!format || !["json", "csv", "jsonl"].includes(format)) {
-    console.error("Usage: context-ledger export --format json|csv|jsonl");
-    process.exit(1);
-  }
-
-  const state = await foldLedger(projectRoot);
-  const decisions = Array.from(state.decisions.values());
-
-  if (format === "jsonl") {
-    // Raw ledger events as JSON array (D1: Option C — raw dump)
-    const events = await readLedger(projectRoot);
-    console.log(JSON.stringify(events, null, 2));
-    return;
-  }
-
-  if (format === "json") {
-    // Materialized decisions with current state and scores (D1: Option C — materialized)
-    const output = decisions.map((d) => ({
-      ...d.record,
-      current_state: d.state,
-      effective_rank_score: d.effective_rank_score,
-      reinforcement_count: d.reinforcement_count,
-    }));
-    console.log(JSON.stringify(output, null, 2));
-  } else {
-    // CSV
-    const header = "decision_id,summary,state,scope_type,scope_id,decision_kind,durability,evidence_type,created";
-    console.log(header);
-    for (const d of decisions) {
-      const row = [
-        d.record.id,
-        csvEscape(d.record.summary),
-        d.state,
-        d.record.scope.type,
-        d.record.scope.id,
-        csvEscape(d.record.decision_kind),
-        d.record.durability,
-        d.record.evidence_type,
-        d.record.created,
-      ].join(",");
-      console.log(row);
+function parseNameStatus(raw: string): ParsedDiff {
+  const result: ParsedDiff = { all: [], added: [], deleted: [], modified: [], renamed: [] };
+  // NUL-delimited: status\0path\0 (or status\0oldpath\0newpath\0 for renames)
+  const parts = raw.split("\0").filter(Boolean);
+  let i = 0;
+  while (i < parts.length) {
+    const status = parts[i];
+    if (status.startsWith("R")) {
+      const from = parts[i + 1] ?? "";
+      const to = parts[i + 2] ?? "";
+      result.renamed.push({ from, to });
+      result.all.push(to);
+      i += 3;
+    } else {
+      const path = parts[i + 1] ?? "";
+      result.all.push(path);
+      if (status === "A") result.added.push(path);
+      else if (status === "D") result.deleted.push(path);
+      else if (status === "M") result.modified.push(path);
+      i += 2;
     }
   }
-}
-
-function csvEscape(value: string): string {
-  if (value.includes(",") || value.includes('"') || value.includes("\n")) {
-    return `"${value.replace(/"/g, '""')}"`;
-  }
-  return value;
+  return result;
 }
 ```
 
-### Validation Gate — Phase 2
-
-```bash
-npx tsc --noEmit
-
-# query (requires existing ledger data)
-node dist/cli.js query "event sourcing"
-
-# stats
-node dist/cli.js stats
-
-# export json
-node dist/cli.js export --format json | head -20
-
-# export csv
-node dist/cli.js export --format csv | head -5
-```
-
-**STOP AND REPORT:** Phase 2 complete. All read commands working. Proceed to Phase 3.
-
----
-
-## Phase 3: Validation Commands
-
-**Files:** `src/cli.ts` (append handlers)
-
-### Step 3.1: validate command
+### Module-level debug flag
 
 ```typescript
-async function handleValidate(): Promise<void> {
-  const subcommand = args[1]; // --propose-repair or --apply-repair or undefined
-  const issues: string[] = [];
+const DEBUG = !!process.env.CONTEXT_LEDGER_DEBUG;
+function debug(msg: string): void { if (DEBUG) console.error(`[context-ledger] ${msg}`); }
+```
 
-  // Council fix C6: Raw JSONL line-by-line check BEFORE folding
-  for (const [label, filePath] of [["ledger", ledgerPath(projectRoot)], ["inbox", inboxPath(projectRoot)]] as const) {
-    try {
-      const raw = await readFile(resolve(projectRoot, filePath), "utf8");
-      const lines = raw.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (line === "") continue;
-        try { JSON.parse(line); } catch {
-          issues.push(`Malformed JSON on line ${i + 1} of ${label}.jsonl`);
+### Implementation Steps (CORRECTED ORDER per Council + Human Input)
+
+**1. Resolve projectRoot:**
+```typescript
+const projectRoot = process.env.CONTEXT_LEDGER_PROJECT_ROOT ?? process.cwd();
+debug(`projectRoot: ${projectRoot}`);
+```
+
+**2. Load config + check enabled:**
+```typescript
+const config = await loadConfig(projectRoot);
+if (!config.capture.enabled) { debug("capture disabled"); return; }
+```
+
+**3. Get commit message FIRST (for early exit — Council fix I4):**
+```typescript
+const sha = execSync("git rev-parse HEAD", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" }).trim();
+const subject = execSync("git log -1 --format=%s HEAD", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" }).trim();
+const fullBody = execSync("git log -1 --format=%B HEAD", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" }).trim();
+```
+
+**4. Check no_capture_marker in FULL BODY (Council fix S2):**
+```typescript
+if (fullBody.includes(config.capture.no_capture_marker)) return;
+```
+
+**5. Skip merge commits (Council fix D5):**
+```typescript
+if (isMergeCommit(projectRoot)) return;
+```
+
+**6. Get changed files via single consolidated git command (Council fix I1):**
+```typescript
+let raw: string;
+try {
+  raw = execSync("git diff-tree --root -r --name-status -z HEAD", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" });
+} catch {
+  return; // git command failed — silently exit
+}
+const diff = parseNameStatus(raw);
+if (diff.all.length === 0) return; // empty commit (Council fix S9)
+```
+
+**7. Normalize all paths immediately (Council fix S7):**
+Apply `normalizePath()` (or inline equivalent) to all file arrays before any classification or filtering.
+
+**8. Parse high-value file diffs + Classify:**
+```typescript
+// Parse package.json diff for accurate dependency detection (~20ms, worth it)
+const pkgDiff = diff.all.some(f => f.endsWith("package.json"))
+  ? parsePackageJsonDiff(projectRoot)
+  : null;
+
+// Parse .env.example for variable names
+const envChanges = diff.all.some(f => f.includes(".env"))
+  ? parseEnvChanges(projectRoot)
+  : null;
+
+const results = classifyCommit(diff.all, diff.deleted, diff.added, subject, config, pkgDiff);
+if (results.length === 0) { debug("no actionable classifications"); return; }
+debug(`classified: ${results.length} results`);
+```
+
+**9. Tier 2 contradiction detection — BEST EFFORT with inner try/catch (Council fixes C3, C5, S6):**
+
+Only attempt if:
+- `.context-ledger/ledger.jsonl` exists
+- File size is under 100KB (performance gate)
+
+```typescript
+try {
+  const stats = await stat(ledgerPath(projectRoot)).catch(() => null);
+  if (stats && stats.size < 100 * 1024) {
+    const state = await foldLedger(projectRoot);
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.tier === 1) {
+        // Check if any changed file maps to a scope with an active decision
+        for (const f of r.changed_files) {
+          const derived = deriveScope({ file_path: f }, config, state.decisions);
+          if (derived) {
+            // Check for active decisions in this scope
+            for (const [, folded] of state.decisions) {
+              if (folded.state === "active" &&
+                  folded.record.scope.type === derived.type &&
+                  folded.record.scope.id === derived.id) {
+                // Upgrade to Tier 2
+                results[i] = {
+                  tier: 2,
+                  change_category: "contradicts-active-decision",
+                  inbox_type: "question_needed",
+                  changed_files: r.changed_files,
+                };
+                break;
+              }
+            }
+          }
+          if (results[i].tier === 2) break; // already upgraded
         }
       }
-    } catch (err: any) {
-      if (err.code !== "ENOENT") issues.push(`Cannot read ${label}: ${err.message}`);
     }
   }
-
-  // Run fold with strict: false to collect lifecycle warnings
-  const state = await foldLedger(projectRoot, { strict: false });
-  const inbox = await readInbox(projectRoot);
-  const decisions = Array.from(state.decisions.values());
-  issues.push(...state.warnings);
-
-  // Check for stale file references (D3: warnings only, not errors)
-  const warnings: string[] = [];
-  for (const d of decisions) {
-    if (d.state !== "active") continue;
-    for (const filePath of d.record.affected_files) {
-      try {
-        await access(resolve(projectRoot, filePath));
-      } catch {
-        warnings.push(`Stale file reference in ${d.record.id}: ${filePath} does not exist`);
-      }
-    }
-  }
-
-  // Check inbox structural integrity
-  for (const item of inbox) {
-    if (!item.inbox_id || !item.status || !item.created) {
-      issues.push(`Malformed inbox item: missing required fields (id=${item.inbox_id})`);
-    }
-  }
-
-  if (subcommand === "--propose-repair") {
-    return proposeRepair(state, issues);
-  }
-
-  if (subcommand === "--apply-repair") {
-    console.error("validate --apply-repair is not yet implemented.");
-    console.error("Use --propose-repair to generate a repair plan first.");
-    process.exit(1);
-  }
-
-  // Default: report issues and warnings separately
-  if (warnings.length > 0) {
-    console.log(`Warnings (${warnings.length}):`);
-    for (const w of warnings) console.log(`  - ${w}`);
-    console.log("");
-  }
-
-  if (issues.length === 0) {
-    console.log(`Ledger integrity check passed.${warnings.length > 0 ? ` ${warnings.length} warning(s).` : " No issues found."}`);
-    return;
-  }
-
-  console.log(`Errors (${issues.length}):`);
-  for (const issue of issues) {
-    console.log(`  - ${issue}`);
-  }
-  process.exit(1); // D3: Only errors cause exit 1, not stale file warnings
-}
-```
-
-### Step 3.2: validate --propose-repair
-
-```typescript
-async function proposeRepair(state: MaterializedState, issues: string[]): Promise<void> {
-  const decisions = Array.from(state.decisions.values());
-  const repairs: string[] = [];
-
-  // Near-duplicate detection: same scope + similar summary
-  const activeByScope = new Map<string, FoldedDecision[]>();
-  for (const d of decisions) {
-    if (d.state !== "active") continue;
-    const scopeKey = `${d.record.scope.type}/${d.record.scope.id}`;
-    if (!activeByScope.has(scopeKey)) activeByScope.set(scopeKey, []);
-    activeByScope.get(scopeKey)!.push(d);
-  }
-
-  for (const [scopeKey, scopeDecisions] of activeByScope) {
-    if (scopeDecisions.length < 2) continue;
-    // Flag scopes with multiple active decisions for review
-    repairs.push(
-      `REVIEW: Scope "${scopeKey}" has ${scopeDecisions.length} active decisions: ${scopeDecisions.map(d => d.record.id).join(", ")}. Consider superseding duplicates.`
-    );
-  }
-
-  // Stale scope aliases
-  for (const d of decisions) {
-    if (d.state !== "active") continue;
-    for (const alias of d.record.scope_aliases) {
-      try {
-        await access(resolve(projectRoot, alias));
-      } catch {
-        repairs.push(
-          `UPDATE: Scope alias "${alias}" in ${d.record.id} no longer exists. Consider removing or updating.`
-        );
-      }
-    }
-  }
-
-  if (issues.length === 0 && repairs.length === 0) {
-    console.log("No issues or repair suggestions found.");
-    return;
-  }
-
-  if (issues.length > 0) {
-    console.log(`Issues (${issues.length}):`);
-    for (const issue of issues) console.log(`  - ${issue}`);
-    console.log("");
-  }
-
-  if (repairs.length > 0) {
-    console.log(`Repair Suggestions (${repairs.length}):`);
-    for (const repair of repairs) console.log(`  - ${repair}`);
+} catch {
+  // Tier 2 detection failed — continue with Tier 1 results only
+  if (process.env.CONTEXT_LEDGER_DEBUG) {
+    console.error("[context-ledger] Tier 2 contradiction detection failed, continuing with Tier 1");
   }
 }
 ```
 
-### Validation Gate — Phase 3
-
-```bash
-npx tsc --noEmit
-
-# validate
-node dist/cli.js validate
-
-# validate --propose-repair
-node dist/cli.js validate --propose-repair
-```
-
-**STOP AND REPORT:** Phase 3 complete. Validation commands working. Proceed to Phase 4.
-
----
-
-## Phase 4: Write Commands (init, tidy)
-
-**Files:** `src/cli.ts` (append handlers)
-
-### Step 4.1: init command
-
+**10. Build diff_summary FIRST, then redact BOTH (Council fix C1):**
 ```typescript
-async function handleInit(): Promise<void> {
-  const dir = ledgerDir(projectRoot);
+const redactedMessage = redact(subject, config.capture.redact_patterns);
+const extras = { packageJsonDiff: pkgDiff, envVarChanges: envChanges };
 
-  // Create directory
-  await mkdir(dir, { recursive: true });
-
-  // Write default config
-  const cfgPath = configPath(projectRoot);
-  try {
-    await access(cfgPath);
-    console.log("config.json already exists, skipping.");
-  } catch {
-    await writeFile(cfgPath, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n", "utf8");
-    console.log("Created .context-ledger/config.json");
-  }
-
-  // Create .gitkeep
-  const gitkeepPath = join(dir, ".gitkeep");
-  try {
-    await access(gitkeepPath);
-  } catch {
-    await writeFile(gitkeepPath, "", "utf8");
-  }
-
-  // Detect and install post-commit hook
-  await installPostCommitHook();
-
-  console.log("\ncontext-ledger initialized successfully!");
-  console.log("\nNext steps:");
-  console.log("  1. Run 'context-ledger setup' for guided configuration");
-  console.log("  2. Add .context-ledger/ to your .gitignore (except config.json)");
-  console.log("  3. Start capturing decisions with your MCP client");
+for (const result of results) {
+  const rawSummary = buildDiffSummary(result, extras);
+  const redactedSummary = redact(rawSummary, config.capture.redact_patterns);
+  const item = buildInboxItem(result, sha, redactedMessage, redactedSummary, config);
+  await appendToInbox(item, projectRoot);
+  console.error(`[context-ledger] Captured ${result.change_category} (${result.inbox_type})`);
 }
 ```
 
-**Hook installation logic:**
-
+**11. Wrap entire function in try/catch:**
 ```typescript
-async function installPostCommitHook(): Promise<void> {
-  const hookScript = `#!/bin/sh
-# context-ledger post-commit hook
-# Instantaneous, deterministic — zero LLM calls, zero network calls.
-node -e "import('context-ledger/dist/capture/hook.js').then(m => m.postCommit()).catch(() => {})" 2>/dev/null || true
-`;
-
-  // Check for Husky (.husky/)
-  const huskyDir = join(projectRoot, ".husky");
+export async function postCommit(): Promise<void> {
   try {
-    await access(huskyDir);
-    const hookPath = join(huskyDir, "post-commit");
-    await writeFile(hookPath, hookScript, { mode: 0o755 });
-    console.log("Installed post-commit hook via Husky (.husky/post-commit)");
-    return;
-  } catch { /* not husky */ }
-
-  // Check for Lefthook (lefthook.yml)
-  try {
-    await access(join(projectRoot, "lefthook.yml"));
-    console.log("Lefthook detected. Add the following to your lefthook.yml:");
-    console.log('  post-commit:\n    commands:\n      context-ledger:\n        run: node -e "import(\'context-ledger/dist/capture/hook.js\').then(m => m.postCommit()).catch(() => {})"');
-    return;
-  } catch { /* not lefthook */ }
-
-  // Check for simple-git-hooks
-  try {
-    const pkg = JSON.parse(await readFile(join(projectRoot, "package.json"), "utf8"));
-    if (pkg["simple-git-hooks"]) {
-      console.log("simple-git-hooks detected. Add to package.json:");
-      console.log('  "simple-git-hooks": { "post-commit": "node -e \\"import(\'context-ledger/dist/capture/hook.js\').then(m => m.postCommit()).catch(() => {})\\"" }');
-      return;
-    }
-  } catch { /* ignore */ }
-
-  // Bare .git/hooks/
-  const bareHookDir = join(projectRoot, ".git", "hooks");
-  try {
-    await access(bareHookDir);
-    const hookPath = join(bareHookDir, "post-commit");
-    try {
-      await access(hookPath);
-      // Hook already exists — append
-      const existing = await readFile(hookPath, "utf8");
-      if (!existing.includes("context-ledger")) {
-        await writeFile(hookPath, existing.trimEnd() + "\n\n" + hookScript, { mode: 0o755 });
-        console.log("Appended context-ledger to existing .git/hooks/post-commit");
-      } else {
-        console.log("post-commit hook already contains context-ledger, skipping.");
-      }
-    } catch {
-      // No existing hook — create
-      await writeFile(hookPath, hookScript, { mode: 0o755 });
-      console.log("Installed post-commit hook to .git/hooks/post-commit");
-    }
-  } catch {
-    console.error("Warning: Could not find .git/hooks/ directory. Hook not installed.");
-    console.error("Run 'context-ledger init' from your git repository root.");
-  }
-}
-```
-
-### Step 4.2: tidy command
-
-```typescript
-async function handleTidy(): Promise<void> {
-  const inbox = await readInbox(projectRoot);
-  const now = Date.now();
-  const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
-  const terminalStatuses = new Set(["dismissed", "expired", "ignored"]);
-
-  // First: mark pending items that should transition
-  const config = await loadConfig(projectRoot);
-  const processed = inbox.map((item) => {
-    if (item.status !== "pending") return item;
-    // Expire if past TTL
-    if (new Date(item.expires_after).getTime() < now) {
-      return { ...item, status: "expired" as const };
-    }
-    // Ignore if shown too many times
-    if (item.times_shown >= config.capture.inbox_max_prompts_per_item) {
-      return { ...item, status: "ignored" as const };
-    }
-    return item;
-  });
-
-  // Filter out terminal entries older than 30 days
-  const kept = processed.filter((item) => {
-    if (!terminalStatuses.has(item.status)) return true;
-    const age = now - new Date(item.created).getTime();
-    return age < thirtyDaysMs;
-  });
-
-  const removed = inbox.length - kept.length;
-
-  if (removed === 0) {
-    console.log("No stale inbox entries to remove.");
-    return;
-  }
-
-  await rewriteInbox(kept, projectRoot);
-  console.log(`Removed ${removed} stale inbox entries. ${kept.length} entries remaining.`);
-}
-```
-
-### Validation Gate — Phase 4
-
-```bash
-npx tsc --noEmit
-
-# init (run in a temp dir to avoid clobbering)
-# Or test in current project — config.json already exists so it skips
-node dist/cli.js init
-
-# tidy
-node dist/cli.js tidy
-```
-
-**STOP AND REPORT:** Phase 4 complete. init and tidy working. Proceed to Phase 5.
-
----
-
-## Phase 5: Backfill Commands
-
-**Files:** `src/cli.ts` (append handlers)
-
-### Step 5.1: backfill --max N
-
-The backfill command reads git log, classifies structural commits, and presents them for the user to review. Since `src/capture/classify.ts` is a stub, implement lightweight classification inline.
-
-```typescript
-async function handleBackfill(): Promise<void> {
-  const isResume = args.includes("--resume");
-  const maxIdx = args.indexOf("--max");
-  const maxCommits = maxIdx >= 0 ? parseInt(args[maxIdx + 1], 10) : 5;
-
-  if (isNaN(maxCommits) || maxCommits < 1) {
-    console.error("Usage: context-ledger backfill --max <N> (N must be a positive integer)");
-    process.exit(1);
-  }
-
-  if (isResume) {
-    return resumeBackfill();
-  }
-
-  // Get structural commits from last 90 days
-  // Council fix C3: Use NUL byte delimiter to avoid commit messages with "|"
-  const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-  let gitLog: string;
-  try {
-    gitLog = execSync(
-      `git log --since="${ninetyDaysAgo}" --format="%H%x00%s%x00%ai" --diff-filter=ADRC --name-only`,
-      { cwd: projectRoot, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }
-    );
+    // ... all the above ...
   } catch (err: any) {
-    console.error("Failed to read git log. Are you in a git repository?");
-    process.exit(1);
+    debug(`Hook error (non-fatal): ${err.message}`);
+    // Never throw — never block git commit
   }
-
-  // Parse git log into commit records
-  const commits = parseGitLog(gitLog);
-
-  // Filter to structural commits only
-  const structural = commits.filter((c) => isStructuralCommit(c));
-
-  if (structural.length === 0) {
-    console.log("No structural commits found in the last 90 days.");
-    return;
-  }
-
-  // Council fix C2 (partial): Group by top-level directory for scope-area UX
-  const byDirectory = new Map<string, BackfillCommit[]>();
-  for (const c of structural) {
-    const dir = c.files.length > 0 ? c.files[0].split("/")[0] : "root";
-    if (!byDirectory.has(dir)) byDirectory.set(dir, []);
-    byDirectory.get(dir)!.push(c);
-  }
-
-  console.log(`Found ${structural.length} structural commit(s) in ${byDirectory.size} area(s). Processing up to ${maxCommits}.\n`);
-
-  let captured = 0;
-  let remaining: string[] = [];
-
-  for (const [dir, dirCommits] of byDirectory) {
-    if (captured >= maxCommits) {
-      remaining.push(...dirCommits.map((c) => c.sha));
-      continue;
-    }
-    console.log(`--- Area: ${dir}/ (${dirCommits.length} commits) ---\n`);
-    for (const commit of dirCommits) {
-      if (captured >= maxCommits) {
-        remaining.push(commit.sha);
-        continue;
-      }
-
-    console.log(`Commit: ${commit.sha.slice(0, 8)} — ${commit.message}`);
-    console.log(`  Files: ${commit.files.join(", ")}`);
-    console.log(`  Category: ${commit.category}`);
-    console.log("  Action: auto-drafting to inbox...");
-
-    // Council fix S8: Use top-level imports, not dynamic import
-    const item: InboxItem = {
-      inbox_id: generateInboxId(),
-      type: "draft_needed",
-      created: new Date().toISOString(),
-      commit_sha: commit.sha,
-      commit_message: commit.message,
-      change_category: commit.category,
-      changed_files: commit.files,
-      diff_summary: `Backfill from commit ${commit.sha.slice(0, 8)}`,
-      priority: "normal",
-      expires_after: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-      times_shown: 0,
-      last_prompted_at: null,
-      status: "pending",
-    };
-    await appendToInbox(item, projectRoot);
-    captured++;
-    console.log("");
-    }
-  }
-
-  // Save backfill state for --resume
-  const stateFile = join(ledgerDir(projectRoot), "backfill-state.json");
-  if (remaining.length > 0) {
-    await writeFile(stateFile, JSON.stringify({ remaining, savedAt: new Date().toISOString() }, null, 2), "utf8");
-    console.log(`Backfill progress saved. ${remaining.length} commits remaining.`);
-    console.log("Run 'context-ledger backfill --resume' to continue.");
-  }
-
-  console.log(`\nDrafted ${captured} inbox item(s). Use your MCP client to confirm or correct them.`);
 }
 ```
 
-**Git log parsing and structural commit classification:**
-
+**12. Self-invocation guard at module level:**
 ```typescript
-interface BackfillCommit {
-  sha: string;
-  message: string;
-  date: string;
-  files: string[];
-  category: string;
-}
-
-function parseGitLog(raw: string): BackfillCommit[] {
-  // Council fix C3: NUL byte delimiter — safe for commit messages containing any character
-  const commits: BackfillCommit[] = [];
-  const lines = raw.split("\n");
-  let current: BackfillCommit | null = null;
-
-  for (const line of lines) {
-    if (line.includes("\0")) {
-      const parts = line.split("\0");
-      if (parts.length >= 3) {
-        if (current) commits.push(current);
-        current = { sha: parts[0], message: parts[1], date: parts[2], files: [], category: "" };
-      }
-    } else if (line.trim() && current) {
-      current.files.push(line.trim());
-    }
-  }
-  if (current) commits.push(current);
-
-  // Classify each commit
-  for (const c of commits) {
-    c.category = classifyCommit(c);
-  }
-
-  return commits;
-}
-
-function classifyCommit(commit: BackfillCommit): string {
-  const { message, files } = commit;
-  const msg = message.toLowerCase();
-
-  // Tier 1 classifications (from design spec)
-  if (files.some((f) => f === "package.json" || f === "package-lock.json")) return "dependency-change";
-  if (files.some((f) => f.includes(".env"))) return "env-var-change";
-  if (files.some((f) => f.match(/tsconfig|eslint|\.prettierrc|jest\.config|vitest|\.github/))) return "config-change";
-  if (files.some((f) => f.match(/schema|migration|\.prisma|\.sql/))) return "schema-change";
-  if (files.some((f) => f.match(/\/api\/|\/routes?\//))) return "api-route-change";
-
-  // Structural signals
-  if (msg.includes("delete") || msg.includes("remove") || msg.includes("drop")) return "removal";
-  if (files.length >= 5) return "multi-file-change";
-
-  return "other";
-}
-
-function isStructuralCommit(commit: BackfillCommit): boolean {
-  const ignoredCategories = new Set(["other"]);
-  return !ignoredCategories.has(commit.category);
+const isDirectRun = process.argv[1]?.endsWith("hook.js") || process.argv[1]?.endsWith("hook.ts");
+if (isDirectRun) {
+  postCommit().catch(() => {});
 }
 ```
 
-### Step 5.2: backfill --resume
-
+### Additional imports needed:
 ```typescript
-async function resumeBackfill(): Promise<void> {
-  const stateFile = join(ledgerDir(projectRoot), "backfill-state.json");
-  let stateData: { remaining: string[]; savedAt: string };
-  try {
-    stateData = JSON.parse(await readFile(stateFile, "utf8"));
-  } catch {
-    console.error("No backfill session to resume. Run 'context-ledger backfill --max N' first.");
-    process.exit(1);
-  }
-
-  if (!stateData.remaining || stateData.remaining.length === 0) {
-    console.log("Previous backfill session is complete. No commits remaining.");
-    return;
-  }
-
-  console.log(`Resuming backfill from ${stateData.savedAt}. ${stateData.remaining.length} commits remaining.\n`);
-
-  // Re-read git log for just the remaining SHAs
-  const maxIdx = args.indexOf("--max");
-  const maxCommits = maxIdx >= 0 ? parseInt(args[maxIdx + 1], 10) : 5;
-  const toProcess = stateData.remaining.slice(0, maxCommits);
-  let captured = 0;
-
-  for (const sha of toProcess) {
-    let commitInfo: string;
-    try {
-      commitInfo = execSync(`git log -1 --format="%H%x00%s%x00%ai" --name-only ${sha}`, {
-        cwd: projectRoot, encoding: "utf8",
-      });
-    } catch {
-      console.error(`  Skipping ${sha.slice(0, 8)}: commit not found`);
-      continue;
-    }
-
-    const parsed = parseGitLog(commitInfo);
-    if (parsed.length === 0) continue;
-    const commit = parsed[0];
-
-    console.log(`Commit: ${commit.sha.slice(0, 8)} — ${commit.message}`);
-    console.log(`  Files: ${commit.files.join(", ")}`);
-    console.log(`  Category: ${commit.category}`);
-    console.log("  Action: auto-drafting to inbox...");
-
-    // Council fix S8: Use top-level imports
-    const item: InboxItem = {
-      inbox_id: generateInboxId(),
-      type: "draft_needed",
-      created: new Date().toISOString(),
-      commit_sha: commit.sha,
-      commit_message: commit.message,
-      change_category: commit.category,
-      changed_files: commit.files,
-      diff_summary: `Backfill from commit ${commit.sha.slice(0, 8)}`,
-      priority: "normal",
-      expires_after: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString(),
-      times_shown: 0,
-      last_prompted_at: null,
-      status: "pending",
-    };
-    await appendToInbox(item, projectRoot);
-    captured++;
-    console.log("");
-  }
-
-  // Update state
-  const remaining = stateData.remaining.slice(maxCommits);
-  if (remaining.length > 0) {
-    await writeFile(stateFile, JSON.stringify({ remaining, savedAt: new Date().toISOString() }, null, 2), "utf8");
-    console.log(`${remaining.length} commits remaining. Run --resume again to continue.`);
-  } else {
-    // Clean up state file — import unlink from top-level node:fs/promises
-    const { unlink } = await import("node:fs/promises");
-    await unlink(stateFile).catch(() => {});
-    console.log("Backfill complete! No commits remaining.");
-  }
-
-  console.log(`Drafted ${captured} inbox item(s).`);
-}
+import { stat } from "node:fs/promises";
+import { ledgerPath } from "../ledger/index.js";
 ```
 
-### Validation Gate — Phase 5
+Note: `ParsedPackageJson` type is imported from `./classify.js` (defined there alongside ClassifyResult).
+
+### Validation Gate
 
 ```bash
-npx tsc --noEmit
+npx tsc --noEmit 2>&1 | head -20
+# Expected: errors only in index.ts (barrel not yet updated)
+# hook.ts should compile clean
 
-# backfill (should find structural commits)
-node dist/cli.js backfill --max 2
+# Verify no console.log usage
+grep -n "console.log" src/capture/hook.ts
+# Expected: 0 matches
 
-# Check inbox grew
-node dist/cli.js stats
+# Verify no rewriteInbox usage
+grep -n "rewriteInbox" src/capture/hook.ts
+# Expected: 0 matches
 ```
 
-**STOP AND REPORT:** Phase 5 complete. Backfill working. Proceed to Phase 6.
+### STOP AND REPORT
+Show: (1) Hook entry point signature, (2) Git command count (should be 3-4 total: rev-parse, log subject, log body, diff-tree), (3) Redaction order confirmed correct, (4) Compile errors remaining.
 
 ---
 
-## Phase 6: Setup Delegation
+## Phase 3: Barrel Exports (src/capture/index.ts)
 
-**Files:** `src/cli.ts` (append handler)
+### File: `src/capture/index.ts`
 
-### Step 6.1: setup command
-
-Since `src/setup.ts` is a stub, the CLI should attempt dynamic import and gracefully handle failure:
+Replace the 2-line stub:
 
 ```typescript
-async function handleSetup(): Promise<void> {
-  try {
-    const setup = await import("./setup.js");
-    if (typeof setup.default === "function") {
-      await setup.default();
-    } else if (typeof setup.runSetup === "function") {
-      await setup.runSetup();
-    } else {
-      console.error("Setup wizard is not yet implemented.");
-      console.error("Use 'context-ledger init' for basic initialization.");
-      process.exit(1);
-    }
-  } catch {
-    console.error("Setup wizard is not yet implemented.");
-    console.error("Use 'context-ledger init' for basic initialization.");
-    process.exit(1);
-  }
-}
+// context-ledger — capture barrel exports
+export type { ClassifyResult } from "./classify.js";
+export { classifyCommit } from "./classify.js";
+export { postCommit } from "./hook.js";
 ```
 
-### Validation Gate — Phase 6
+### Validation Gate
 
 ```bash
-npx tsc --noEmit
-
-# setup (should print "not yet implemented")
-node dist/cli.js setup
+npx tsc --noEmit 2>&1 | head -20
+# Expected: ZERO errors — all three files compile clean
 ```
 
-**STOP AND REPORT:** Phase 6 complete. All commands implemented.
+### STOP AND REPORT
+Show: compile result (0 errors expected).
 
 ---
 
-## Phase 7: Final Validation
+## Phase 4: package.json Script
+
+### Edit: `package.json`
+
+Add to the `"scripts"` section:
+
+```json
+"postcommit": "node dist/capture/hook.js"
+```
+
+### Validation Gate
 
 ```bash
 # Full build
-npx tsc --noEmit
+npm run build
+# Expected: ZERO errors
+```
 
-# All commands
-node dist/cli.js --help
-node dist/cli.js --version
-node dist/cli.js stats
-node dist/cli.js query "event sourcing"
-node dist/cli.js export --format json | head -20
-node dist/cli.js export --format csv | head -5
-node dist/cli.js validate
-node dist/cli.js validate --propose-repair
-node dist/cli.js tidy
-node dist/cli.js init
-node dist/cli.js setup
+### STOP AND REPORT
+Show: build result.
 
-# Verify no console.log leaks in serve mode (serve is the only command where stdout = JSON-RPC)
-# Manual: run `node dist/cli.js serve` and verify only JSON-RPC output on stdout
+---
 
-# Unknown command
-node dist/cli.js unknown-cmd; echo "exit code: $?"
-# Should exit with code 1
+## Phase 5: Documentation Sync
 
-# Council fix I2: Edge case smoke tests
-# Empty/missing ledger — should print helpful message, not crash
-mkdir /tmp/test-cli && cd /tmp/test-cli && node /path/to/dist/cli.js stats
-# Should print "Run 'context-ledger init' first" (pre-flight check)
-
-# Malformed JSONL
-echo "not json" > .context-ledger/ledger.jsonl && node dist/cli.js validate
-# Should report malformed line
-
-# CSV on zero decisions
-node dist/cli.js export --format csv
-# Should print header only
-
-# --format=json (equals syntax)
-node dist/cli.js export --format=json | head -5
-
-# agent-guard sync
+```bash
 npx agent-guard sync
 ```
 
-**STOP AND REPORT:** All phases complete. CLI fully implemented.
+Review changes to `docs/ARCHITECTURE.md` and any other files. Stage if correct.
+
+### STOP AND REPORT
+Show: files modified by agent-guard.
 
 ---
 
-## Key Design Decisions in This Guide
+## Phase 6: Final Validation
 
-1. **mcp-server.ts refactor:** Extract `startMcpServer()` function rather than duplicating MCP setup in cli.ts. Avoids drift.
-2. **searchDecisions for query command:** Design spec says "CLI/debugging only, lexical fallback" — `searchDecisions` is the correct function, not `queryDecisions`.
-3. **Inline classification for backfill:** Since capture/classify.ts is a stub, implement lightweight Tier 1 classification in cli.ts. Can be migrated later.
-4. **backfill-state.json for --resume:** Store in `.context-ledger/` alongside other state files. Contains array of remaining commit SHAs.
-5. **Dynamic import for setup:** Graceful fallback since setup.ts is a stub. No hard dependency.
-6. **validate uses foldLedger({ strict: false }):** Collects all warnings instead of throwing on first error. Additional fs.access() checks for stale file refs.
-7. **mcp-server-bin.ts:** Separate bin wrapper instead of self-execution guard (Council C4).
-8. **NUL-delimited git log:** Prevents commit message parsing bugs (Council C3).
-9. **Directory-grouped backfill:** Groups by top-level directory for better UX (Council C2 partial).
+### Build
+
+```bash
+npm run build
+# MUST pass with ZERO errors
+```
+
+### Manual Smoke Test
+
+```bash
+# Run the hook directly (will use current HEAD):
+node dist/capture/hook.js
+# Should print something to stderr or silently exit 0
+
+# Check if .context-ledger/inbox.jsonl has new entries (if any structural changes in current HEAD)
+cat .context-ledger/inbox.jsonl 2>/dev/null | tail -3
+```
+
+### Code Quality Checks
+
+```bash
+# No console.log in capture files (only console.error)
+grep -rn "console.log" src/capture/
+# Expected: 0 matches
+
+# All imports use .js extensions
+grep -rn 'from "\.\.' src/capture/ | grep -v '\.js"'
+# Expected: 0 matches (all imports end in .js)
+
+# No network calls
+grep -rn "fetch\|http\|https\|axios\|node-fetch" src/capture/
+# Expected: 0 matches
+
+# Append-only — no rewriteInbox usage
+grep -rn "rewriteInbox" src/capture/
+# Expected: 0 matches
+```
+
+### STOP AND REPORT
+Show: build result, smoke test output, all quality checks.
 
 ---
 
-## Refinement Log (Council Feedback Applied)
+## Human Input Applied (Bucket 2 Answers)
 
-### Applied Fixes (Bucket 1)
-- **C1:** Added decision_kind and verification_status to stats output
-- **C2 (partial):** Backfill groups commits by top-level directory instead of flat chronological
-- **C3:** Changed git log delimiter from "|" to NUL byte (\0) to handle pipe in commit messages
-- **C4:** Replaced brittle argv[1] guard with export-only mcp-server.ts + separate bin wrapper
-- **C6:** Added raw JSONL line-by-line validation before folding in validate command
-- **S1:** Marked --apply-repair as "(not yet implemented)" in --help
-- **S3:** Added getFlag() helper for --flag=value syntax support
-- **S4:** Added pre-flight .context-ledger/ directory check for commands that need it
-- **S7:** Added sub-command --help support
-- **S8:** Removed dynamic imports in backfill, use top-level imports
-- **I2:** Added edge case smoke tests to Phase 7
+| Q | Decision | Impact |
+|---|----------|--------|
+| Q1 | Extract facts for package.json and .env.example; category + file counts for everything else | Added parsePackageJsonDiff, parseEnvChanges helpers; enhanced buildDiffSummary |
+| Q2 | Parse package.json content diff. Distinguish dependency-add/remove from script changes | Added ParsedPackageJson type, parsePackageJsonDiff helper, split dependency-change into -addition/-removal |
+| Q3 | Cap at 3 inbox items per commit. Tier 2 first, then Tier 1 by file count | Added cap logic to grouping step in classify.ts, log dropped items to stderr |
+| Q4 | Skip merge commits entirely | Added isMergeCommit helper, early return in hook |
+| Q5 | No amend dedup. TTL and max-prompts handle it | No change needed |
+| Q6 | Add CONTEXT_LEDGER_DEBUG env var | Added module-level DEBUG flag and debug() helper |
 
-### Human Decisions Resolved (Bucket 2)
-- **D1:** Option C — `--format json` for materialized state, `--format jsonl` for raw events
-- **D3:** Option A — Stale file refs are warnings only, do not cause exit 1
-- **D5:** Option A — Use `created` date for 30-day calculation, no schema change
+## Refinement Log (Council Fixes Applied)
+
+| ID | Fix | Source |
+|----|-----|--------|
+| C1 | Redaction order: build diff_summary FIRST, then redact both message and summary | Both |
+| C2 | Use `git diff-tree --root -r` for initial commit safety; skip merge commits | Both |
+| C3 | Gate foldLedger behind file size check (<100KB); inner try/catch | Both |
+| C5 | Specify Tier 2 contradiction: deriveScope → check active decisions → upgrade | OpenAI |
+| S1 | ClassifyResult has no null fields — only actionable results returned | OpenAI |
+| S2 | Check full commit body (`%B`) for no_capture_marker, store subject in commit_message | OpenAI |
+| S6 | Inner try/catch around Tier 2 detection; Tier 1 continues on failure | OpenAI |
+| S7 | Normalize all paths immediately after git parsing | OpenAI |
+| S9 | Handle empty commits (diff.all.length === 0 → return) | Gemini |
+| I1 | Single `git diff-tree -z --root -r --name-status HEAD` instead of 3 calls | Both |
+| I2 | buildInboxItem helper centralizes construction | OpenAI |
+| I3 | Sort and dedupe changed_files in buildInboxItem | OpenAI |
+| I4 | Check no_capture_marker before running diff-tree | Gemini |
+| S8 | CONTEXT_LEDGER_DEBUG env var for verbose stderr | Gemini |
+
+---
+
+## Summary
+
+| Phase | File | Action |
+|-------|------|--------|
+| 1 | `src/capture/classify.ts` | Deterministic classifier: 8 Tier 1 + 4 Tier 2 categories + package.json parsing support |
+| 2 | `src/capture/hook.ts` | Post-commit entry: git → parse pkg/env → classify → contradiction check → redact → append (3-item cap) |
+| 3 | `src/capture/index.ts` | Barrel exports |
+| 4 | `package.json` | Add `postcommit` script |
+| 5 | docs | agent-guard sync |
+| 6 | — | Build + smoke test + quality checks |

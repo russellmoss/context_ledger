@@ -31,7 +31,8 @@
     "test:retrieval": "node dist/retrieval/smoke-test.js",
     "test:dogfood": "node dist/ledger/dogfood.js",
     "test:mcp": "node dist/mcp/smoke-test.js",
-    "prepare": "npx husky"
+    "prepare": "npx husky",
+    "postcommit": "node dist/capture/hook.js"
   },
   "engines": {
     "node": ">=18.0.0"

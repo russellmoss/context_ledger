@@ -1,131 +1,112 @@
-# Council Feedback — CLI Implementation (src/cli.ts)
+# Council Feedback — Post-Commit Hook Capture System (src/capture/)
 
 ## Sources
 - OpenAI (gpt-5.4, reasoning_effort: high)
 - Gemini (gemini-3.1-pro-preview)
 
-## Cross-Check Results (Claude)
-
-Before triaging, I verified:
-1. Event types in guide match spec schema — ✅ No new event types needed for CLI
-2. Lifecycle state machine transitions all legal — ✅ CLI is read-only consumer, no transitions
-3. Auto-promotion threshold (>= 0.7) not relevant — CLI doesn't do auto-promotion
-4. Token budgeting — not relevant for CLI (only for MCP query_decisions)
-5. Stats spec says "source, kind, scope, evidence type, verification status" — guide is MISSING kind and verification_status, has extra state and durability
-
 ---
 
 ## CRITICAL
 
-### C1: Stats output missing spec-mandated fields (OpenAI + Gemini)
-**Issue:** Spec requires grouping by: source, kind, scope, evidence type, verification status. Guide provides: state, evidence_type, scope, durability, source. Missing: decision_kind, verification_status.
-**Fix:** Add decision_kind and verification_status groupings. Keep state and durability as bonus sections since they're useful.
+### C1: Redaction order is wrong (Both)
+Steps 7-8 in hook.ts redact BEFORE building diff_summary. Secrets can leak into the final stored summary.
+**Fix:** Build diff_summary first, then redact both commit_message and diff_summary.
 
-### C2: Backfill scope grouping violated (Gemini)
-**Issue:** Design spec says backfill "groups commits by scope area" and resume works "by scope area." Guide uses flat chronological order and saves remaining SHAs.
-**Fix:** After parsing git log, group commits by derived scope area (top-level directory or config mapping). Process one scope group at a time. Save resume state per scope group.
+### C2: Initial commit / merge commit / rename handling (Both)
+- `git diff-tree HEAD` fails on initial commit (no parent) — need `--root` flag
+- Merge commits produce empty or misleading output without `-m` flag
+- Renames show as add+delete, may falsely trigger module-replacement or new-directory
+**Fix:** Use `git diff-tree --root -r` as the default. Add `-c` or skip merge commits. Track renames separately.
 
-### C3: Git log pipe delimiter will break on commit messages containing "|" (OpenAI + Gemini)
-**Issue:** `git log --format="%H|%s|%ai"` parsed with `split("|")` breaks when commit subject contains `|`.
-**Fix:** Use NUL byte delimiter: `--format="%H%x00%s%x00%ai"` and split on `\0`.
+### C3: foldLedger in hook risks 100ms budget (Both)
+Reading and parsing full ledger.jsonl for Tier 2 contradiction detection could blow past 100ms on large ledgers.
+**Fix:** Make Tier 2 contradiction detection best-effort. Gate it: only run if ledger.jsonl exists AND is under a size threshold (e.g., 100KB). If fold fails or times out, emit Tier 1 items only.
 
-### C4: mcp-server.ts argv[1] guard is brittle (OpenAI + Gemini)
-**Issue:** `process.argv[1]?.endsWith("mcp-server.js")` fails with symlinks, npx, Windows paths, alternate runtimes.
-**Fix:** Remove self-execution from mcp-server.ts entirely. Export `startMcpServer` only. The bin entry `context-ledger-mcp` should be a tiny wrapper that imports and calls `startMcpServer`. This is cleaner than any guard.
+### C4: Filename-only metadata insufficient for some classifications (Both)
+`git diff-tree --name-only` can't distinguish dependency-addition vs script-change in package.json, can't detect env var additions vs removals, can't detect style-only changes.
+**Fix:** For specific high-value files (package.json, .env.example), do targeted content comparison using `git show HEAD:file` vs `git show HEAD~1:file`. Keep it to 2-3 files max to stay under budget.
 
-### C5: export --format json semantics unclear (OpenAI + Gemini)
-**Issue:** Spec says "dump ledger." Guide outputs materialized FoldedDecision array with added fields. These are different things.
-**Fix:** Needs human decision — see Design Questions below.
-
-### C6: validate doesn't handle malformed JSONL independently (OpenAI)
-**Issue:** `foldLedger` relies on `readLedger` which silently skips malformed lines with console.error. But validate should REPORT malformed lines as validation failures, not silently skip them.
-**Fix:** Either: (a) have validate read raw JSONL first with line-by-line checking before folding, or (b) capture malformed line count from readLedger output (currently lost to console.error). Option (a) is correct per spec.
+### C5: Tier 2 contradiction detection underspecified (OpenAI)
+The guide doesn't define how foldLedger output maps to a commit change, doesn't mention deriveScope, doesn't define upgrade-from-Tier-1 mechanics.
+**Fix:** Specify: for each classified result with structural signals, call deriveScope({file_path}) for its changed files, check if any active decision exists in that scope. If yes, upgrade to Tier 2 with category "contradicts-active-decision".
 
 ---
 
 ## SHOULD FIX
 
-### S1: validate --apply-repair not implemented
-**Issue:** Both reviewers note this is a spec command. Guide stubs it.
-**Action:** Acceptable for v1 to stub with clear message. Mark as "(not yet implemented)" in --help output.
+### S1: ClassifyResult too loosely typed (OpenAI)
+Allows nonsense states like `tier: 1, inbox_type: null`. Should be discriminated union or at least validated.
+**Fix:** Use a discriminated return: actionable results have tier 1|2 + matching inbox_type + category. Return empty array for ignored, not null-ish results.
 
-### S2: Tidy exceeds spec by mutating pending item status (OpenAI)
-**Issue:** Guide has tidy expire/ignore pending items based on TTL/times_shown. Spec only says "remove terminal entries older than 30 days."
-**Action:** The tidy algorithm in pattern-finder-findings.md section 10 does include this step. This matches the 4-step tidy algorithm derived from the codebase pattern. Keep it.
+### S2: Commit message should be full body, not just subject (OpenAI)
+`git log -1 --format=%s` gets only subject. `[no-capture]` in body would be missed. InboxItem.commit_message name suggests full message.
+**Fix:** Use `%s` for subject (stored in commit_message — matches the design spec example which shows subject only). But check `%B` (full body) for no_capture_marker.
 
-### S3: --format=value syntax not handled (Gemini)
-**Issue:** Manual argv parsing won't handle `--format=json` (equals syntax), only `--format json` (space syntax).
-**Fix:** Add simple equals-sign parsing for flag values.
+### S3: Grouping by 2-level prefix is too rigid (Both)
+A DB provider switch might touch package.json, prisma/, .env.example, app code — splitting into 4+ inbox items. Deletion cleanup across many directories creates inbox spam.
+**Fix:** First classify by change category, then group within category by nearest common ancestor directory. Cap at max 3 inbox items per commit to prevent spam.
 
-### S4: Missing directory check before commands (OpenAI + Gemini)
-**Issue:** Commands other than init should check .context-ledger/ exists and give helpful message.
-**Fix:** Add pre-flight check at start of main() for commands that need the ledger directory.
+### S4: generateInboxId collision risk on multi-item commits (OpenAI)
+`hex2` gives only 256 variants per second. Multiple items in same second will collide.
+**Fix:** Add a sequence counter within the commit processing loop, or use hex4 for inbox IDs.
 
-### S5: fs.access() path normalization for affected_files (OpenAI)
-**Issue:** affected_files may be repo-relative. Need to resolve against projectRoot.
-**Fix:** The guide already uses `resolve(projectRoot, filePath)`. Confirmed correct.
+### S5: Commit amend creates duplicate inbox items (Gemini)
+`git commit --amend` fires post-commit again with new SHA. Old inbox item for old SHA becomes orphaned.
+**Fix:** Before appending, check if inbox already has a pending item with the same change_category and overlapping changed_files from within the last 60 seconds. Skip if found.
 
-### S6: Backfill creates inbox items without all context (OpenAI)
-**Issue:** Git log provides SHA, subject, date. InboxItem also needs changed_files which comes from --name-only. The guide does collect this via `--name-only` flag on git log. Not a real issue.
-**Status:** Non-issue — guide already handles this.
+### S6: Try/catch too coarse (OpenAI)
+One big try/catch drops all captures if any step fails. Tier 1 should still work if Tier 2 enrichment fails.
+**Fix:** Inner try/catch around Tier 2 contradiction detection. If it fails, fall through to Tier 1 classification.
 
-### S7: Sub-command help (Gemini)
-**Issue:** `context-ledger export --help` should show export-specific usage.
-**Fix:** Add command-specific help when --help appears after a command name.
+### S7: normalizePath not consistently applied (OpenAI)
+Plan doesn't specify normalizing paths before ignore matching, grouping, dedup, or writing changed_files.
+**Fix:** Normalize all file paths immediately after git output parsing, before any classification or filtering.
 
-### S8: Dynamic import in backfill handlers (code smell)
-**Issue:** Guide uses `await import("./ledger/index.js")` inside loop iterations for backfill. These are already top-level imports.
-**Fix:** Use the already-imported `appendToInbox` and `generateInboxId` from top-level imports. Remove dynamic imports.
+### S8: Add debug escape hatch (Gemini)
+Silent try/catch makes debugging impossible. Add `CONTEXT_LEDGER_DEBUG` env var for verbose stderr output.
 
----
+### S9: Handle empty commits gracefully (Gemini)
+`git commit --allow-empty` returns no files. Should exit cleanly without writing inbox items.
 
-## DESIGN QUESTIONS (for human)
-
-### D1: JSON export: raw events or materialized state?
-- Option A: Raw JSONL events (spec says "dump ledger" — implies raw)
-- Option B: Materialized FoldedDecision array with state (more useful for analysis)
-- Option C: Both — `--format json` for materialized, `--format jsonl` for raw events
-
-### D2: Should mcp-server.ts remain directly executable?
-- Option A: Keep as standalone bin entry + export startMcpServer (current plan with guard)
-- Option B: Make mcp-server.ts export-only, create tiny bin wrapper (cleanest)
-
-### D3: Stale file references: warning or error?
-- Old decisions referencing deleted files may be normal (files were intentionally removed).
-- Option A: Warning only (don't contribute to exit code 1)
-- Option B: Error (exit 1) — currently in guide
-
-### D4: Multiple active decisions in same scope — is that actually a problem?
-- OpenAI asks: "I don't see that invariant in the spec."
-- If not an invariant, --propose-repair should call it "review suggestion" not "repair"
-- Currently guide labels it as "REVIEW" which seems appropriate.
-
-### D5: Tidy "older than 30 days" — from created date or from status change date?
-- Gemini raises: InboxItem has no `status_updated_at` field
-- If using `created`, a freshly-dismissed 35-day-old item gets deleted next tidy
-- Spec doesn't specify. Current guide uses `created`.
+### S10: Large diff memory protection (Gemini)
+Large commits (package-lock.json, codegen) could cause memory issues if diff content is read.
+**Fix:** Only read content for targeted files (package.json, .env.example). Don't read raw diffs.
 
 ---
 
-## SUGGESTED IMPROVEMENTS (apply at discretion)
+## DESIGN QUESTIONS
 
-### I1: Use NUL-delimited git output for backfill parsing
-Already covered by C3 fix.
+### D1: What exactly should diff_summary contain?
+Just category + file counts? Or extracted facts like dependency names, env var names, route paths?
+**Recommendation:** Keep it to category + file counts + specific extracted facts for package.json/env files only. Example: `"dependency-addition: +@google/genai ^1.46.0"` or `"config-change: modified tsconfig.json, .eslintrc"`.
 
-### I2: Add smoke test list to Phase 7
-Add tests for: empty repo, missing .context-ledger, malformed JSONL, commit message with |, CSV on zero decisions, serve without config.
+### D2: How is contradiction detection scoped deterministically?
+Can't know if code "contradicts" a decision without semantic understanding.
+**Recommendation:** Define "contradiction" as: file governed by active decision was structurally modified (not content-only). This is deterministic and doesn't require LLM inference.
 
-### I3: Remove self-execution from mcp-server.ts
-Already covered by C4 fix — create a bin wrapper instead of guarding argv.
+### D3: Route detection across frameworks
+Next.js app router, Express, Remix, etc. all have different patterns.
+**Recommendation:** Use broad regex patterns that cover common conventions. Accept false positives — the inbox review step handles them.
 
-### I4: Per-command --help
-Add command-specific help text for export, validate, backfill.
+### D4: ignore_paths matching model
+Prefix match? Glob? Regex?
+**Recommendation:** Prefix match on normalized paths. Same as existing behavior in config.ts.
 
-### I5: CSV should handle array fields
-If any CSV columns contain arrays, join with semicolons. Current CSV columns are all scalars, so this is a non-issue for the specified columns.
+### D5: How should merge commits behave?
+**Recommendation:** Skip merge commits entirely (detect via `git rev-parse HEAD^2` succeeding). Merges are integration events, not decision events.
 
-### I6: Runtime validation of persisted JSON
-Add lightweight type guards when reading backfill-state.json and config.json in CLI.
+---
 
-### I7: Init should not silently modify git hooks
-Print what will be modified and let user confirm, or default to printing instructions.
+## SUGGESTED IMPROVEMENTS
+
+### I1: Consolidate git commands (Both)
+Use single `git diff-tree -z --root -r --name-status HEAD` to get status+paths in one call. Parse status letters (A/D/M/R) in JavaScript. Saves 2 execSync calls.
+
+### I2: buildInboxItem helper (OpenAI)
+Centralize InboxItem construction with correct defaults. Prevents schema drift.
+
+### I3: Sort and dedupe changed_files (OpenAI)
+Stable output helps testing and prevents duplicates from mixed inputs.
+
+### I4: Move no_capture_marker check earlier (Gemini)
+Check commit message before running git diff-tree commands. Saves execution time on skipped commits.
