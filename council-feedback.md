@@ -1,112 +1,152 @@
-# Council Feedback — Post-Commit Hook Capture System (src/capture/)
+# Council Feedback — Setup Wizard (src/setup.ts)
 
 ## Sources
 - OpenAI (gpt-5.4, reasoning_effort: high)
-- Gemini (gemini-3.1-pro-preview)
+- Gemini (gemini-3.1-pro-preview, thinking: high)
 
 ---
 
 ## CRITICAL
 
-### C1: Redaction order is wrong (Both)
-Steps 7-8 in hook.ts redact BEFORE building diff_summary. Secrets can leak into the final stored summary.
-**Fix:** Build diff_summary first, then redact both commit_message and diff_summary.
+### C1: isCancel() must be checked after every @clack/prompts call (GPT + Gemini)
+Both reviewers flagged this. `confirm()` and `multiselect()` return a symbol on Ctrl+C. Without `isCancel()` checks, the wizard will either crash or silently write garbage to config. The guide mentions importing `isCancel` and has a general cancel pattern, but does not explicitly mandate it at every prompt site.
 
-### C2: Initial commit / merge commit / rename handling (Both)
-- `git diff-tree HEAD` fails on initial commit (no parent) — need `--root` flag
-- Merge commits produce empty or misleading output without `-m` flag
-- Renames show as add+delete, may falsely trigger module-replacement or new-directory
-**Fix:** Use `git diff-tree --root -r` as the default. Add `-c` or skip merge commits. Track renames separately.
+**Fix**: Add explicit `isCancel()` check after every `confirm()` and `multiselect()` call. On cancel, call `cancel("Setup cancelled.")` and return.
 
-### C3: foldLedger in hook risks 100ms budget (Both)
-Reading and parsing full ledger.jsonl for Tier 2 contradiction detection could blow past 100ms on large ledgers.
-**Fix:** Make Tier 2 contradiction detection best-effort. Gate it: only run if ledger.jsonl exists AND is under a size threshold (e.g., 100KB). If fold fails or times out, emit Tier 1 items only.
+### C2: loadConfig() may return shared DEFAULT_CONFIG singleton — mutation trap (GPT)
+If `loadConfig()` returns `DEFAULT_CONFIG` directly on ENOENT (no deep clone), mutating the returned object mutates the shared default for the process lifetime.
 
-### C4: Filename-only metadata insufficient for some classifications (Both)
-`git diff-tree --name-only` can't distinguish dependency-addition vs script-change in package.json, can't detect env var additions vs removals, can't detect style-only changes.
-**Fix:** For specific high-value files (package.json, .env.example), do targeted content comparison using `git show HEAD:file` vs `git show HEAD~1:file`. Keep it to 2-3 files max to stay under budget.
+**Fix**: Verify that `loadConfig()` returns a fresh deep-merged clone (it uses `deepMerge` which creates new objects). If DEFAULT_CONFIG is returned directly on ENOENT, add a clone. [NEEDS VERIFICATION — check config.ts deepMerge behavior on ENOENT path]
 
-### C5: Tier 2 contradiction detection underspecified (OpenAI)
-The guide doesn't define how foldLedger output maps to a commit change, doesn't mention deriveScope, doesn't define upgrade-from-Tier-1 mechanics.
-**Fix:** Specify: for each classified result with structural signals, call deriveScope({file_path}) for its changed files, check if any active decision exists in that scope. If yes, upgrade to Tier 2 with category "contradicts-active-decision".
+### C3: Config directory must be created before writing config.json (GPT + Gemini)
+Step 2 writes to `configPath(projectRoot)` but the `.context-ledger/` directory may not exist on first run. Guide imports `mkdir` but doesn't state to call it before `writeFile`.
+
+**Fix**: Add `await mkdir(ledgerDir(projectRoot), { recursive: true })` before writing config. [NOTE: Guide actually includes this — see "await mkdir(ledgerDir(projectRoot), { recursive: true })" in Step 2. This is already addressed.]
+
+### C4: Windows path normalization for scope_mappings keys (GPT + Gemini)
+`readdir()` on Windows returns backslash paths. Config spec uses forward slashes (`src/path/`). Without normalization, scope matching will fail.
+
+**Fix**: Normalize all paths to forward slashes before using as config keys: `path.split("\\").join("/")`. Ensure trailing slash on directory paths.
+
+### C5: Step 3 hook logic duplication vs extraction (GPT + Gemini)
+Both reviewers flagged that reimplementing hook detection in setup.ts will drift from cli.ts. GPT recommends extracting to shared module. Gemini agrees.
+
+**Assessment**: The guide intentionally reimplements because the UI is different (@clack/prompts vs console.log). However, the DETECTION logic should be shared. The INSTALLATION logic differs in UI output. Recommended: extract hook detection into a shared helper that returns a HookSystem type, keep installation separate with different UI.
+
+### C6: Step 5 uses raw readLedger() instead of materialized state (GPT)
+`readLedger()` returns all events including transitions and non-decision events. Checking `.length > 0` doesn't mean there are active decisions. A ledger with only superseded decisions would show misleading results.
+
+**Fix**: Use `foldLedger()` to get materialized state, then check if any decisions have `state === "active"`. Or simply try `queryDecisions()` and check if `active_precedents.length > 0`.
+
+### C7: queryDecisions() params not specified for Step 5 (GPT)
+Guide says "call queryDecisions" but doesn't specify the exact params object.
+
+**Fix**: Use `queryDecisions({ query: "architecture" }, projectRoot)` — a broad query that returns any active precedents. Already in the guide's Step 5 code example but should be more prominent.
 
 ---
 
 ## SHOULD FIX
 
-### S1: ClassifyResult too loosely typed (OpenAI)
-Allows nonsense states like `tier: 1, inbox_type: null`. Should be discriminated union or at least validated.
-**Fix:** Use a discriminated return: actionable results have tier 1|2 + matching inbox_type + category. Return empty array for ignored, not null-ish results.
+### S1: Missing src/ directory edge case (GPT + Gemini)
+If project has no `src/` directory, Step 2 will throw ENOENT. Many projects use `app/`, `lib/`, `server/`, etc.
 
-### S2: Commit message should be full body, not just subject (OpenAI)
-`git log -1 --format=%s` gets only subject. `[no-capture]` in body would be missed. InboxItem.commit_message name suggests full message.
-**Fix:** Use `%s` for subject (stored in commit_message — matches the design spec example which shows subject only). But check `%B` (full body) for no_capture_marker.
+**Fix**: Check if `src/` exists first. If not, try common alternatives (`app/`, `lib/`, `packages/`). If none found, skip scope generation with a helpful message.
 
-### S3: Grouping by 2-level prefix is too rigid (Both)
-A DB provider switch might touch package.json, prisma/, .env.example, app code — splitting into 4+ inbox items. Deletion cleanup across many directories creates inbox spam.
-**Fix:** First classify by change category, then group within category by nearest common ancestor directory. Cap at max 3 inbox items per commit to prevent spam.
+### S2: Neither CLAUDE.md nor .cursorrules exists (GPT + Gemini)
+Step 4 doesn't specify what happens if both files are missing. Should it create CLAUDE.md?
 
-### S4: generateInboxId collision risk on multi-item commits (OpenAI)
-`hex2` gives only 256 variants per second. Multiple items in same second will collide.
-**Fix:** Add a sequence counter within the commit processing loop, or use hex4 for inbox IDs.
+**Fix**: If neither exists, offer to create CLAUDE.md with the standing instructions as initial content. Show `confirm()` first.
 
-### S5: Commit amend creates duplicate inbox items (Gemini)
-`git commit --amend` fires post-commit again with new SHA. Old inbox item for old SHA becomes orphaned.
-**Fix:** Before appending, check if inbox already has a pending item with the same change_category and overlapping changed_files from within the last 60 seconds. Skip if found.
+### S3: Both CLAUDE.md and .cursorrules exist (GPT)
+Guide implies "first match wins" but behavior is ambiguous.
 
-### S6: Try/catch too coarse (OpenAI)
-One big try/catch drops all captures if any step fails. Tier 1 should still work if Tier 2 enrichment fails.
-**Fix:** Inner try/catch around Tier 2 contradiction detection. If it fails, fall through to Tier 1 classification.
+**Fix**: Prefer CLAUDE.md. If both exist, inject into CLAUDE.md only (as the primary). Log a note that .cursorrules was found but CLAUDE.md was used.
 
-### S7: normalizePath not consistently applied (OpenAI)
-Plan doesn't specify normalizing paths before ignore matching, grouping, dedup, or writing changed_files.
-**Fix:** Normalize all file paths immediately after git output parsing, before any classification or filtering.
+### S4: Idempotency marker too weak — "context-ledger" string (GPT + Gemini)
+Plain string "context-ledger" can false-positive on prose mentions of the package name.
 
-### S8: Add debug escape hatch (Gemini)
-Silent try/catch makes debugging impossible. Add `CONTEXT_LEDGER_DEBUG` env var for verbose stderr output.
+**Fix**: Use the specific heading `## context-ledger Integration` as the marker for standing instructions. Use `"context-ledger post-commit hook"` as the marker for hooks (already more specific).
 
-### S9: Handle empty commits gracefully (Gemini)
-`git commit --allow-empty` returns no files. Should exit cleanly without writing inbox items.
+### S5: multiselect() with empty options array (GPT)
+If no directories found, calling multiselect with `[]` options is broken UX.
 
-### S10: Large diff memory protection (Gemini)
-Large commits (package-lock.json, codegen) could cause memory issues if diff content is read.
-**Fix:** Only read content for targeted files (package.json, .env.example). Don't read raw diffs.
+**Fix**: Check if suggestions array is non-empty before calling multiselect. If empty, log info message and skip.
+
+### S6: Sort directory suggestions for deterministic output (GPT)
+readdir() order is not guaranteed across platforms.
+
+**Fix**: Sort suggestions alphabetically before presenting in multiselect.
+
+### S7: feature_hint_mappings generation underspecified (GPT + Gemini)
+Guide mentions generating hints but doesn't specify the exact mapping strategy or merge behavior.
+
+**Fix**: Generate simple keyword mappings from directory basenames. Merge additively — never overwrite existing user-curated hints.
+
+### S8: Agent-guard block detection too vague (GPT)
+"If agent-guard block exists, append after" — what identifies the block?
+
+**Fix**: Search for `## agent-guard` or `# agent-guard` heading. If found, find the next heading of same or higher level, and insert before it. If no next heading, append to end.
+
+### S9: Direct-run detection is brittle (GPT)
+`process.argv[1]?.endsWith("setup.js")` breaks under npm shims and Windows.
+
+**Fix**: Use `import.meta.url` comparison instead:
+```typescript
+import { fileURLToPath } from "node:url";
+const isDirectRun = process.argv[1] === fileURLToPath(import.meta.url);
+```
+
+### S10: No .git directory handling (Gemini)
+If user runs setup before `git init`, hook installation will fail cryptically.
+
+**Fix**: Detect missing `.git/` and show helpful warning: "No git repository found. Run 'git init' and re-run setup to install hooks."
+
+### S11: Existing config entries should not be overwritten (GPT + Gemini)
+Generated scope_mappings should be additive, not replace existing manual entries.
+
+**Fix**: After loadConfig, only add new keys. If a key already exists in scope_mappings, skip it and note "already configured".
 
 ---
 
 ## DESIGN QUESTIONS
 
-### D1: What exactly should diff_summary contain?
-Just category + file counts? Or extracted facts like dependency names, env var names, route paths?
-**Recommendation:** Keep it to category + file counts + specific extracted facts for package.json/env files only. Example: `"dependency-addition: +@google/genai ^1.46.0"` or `"config-change: modified tsconfig.json, .eslintrc"`.
+### D1: What should Step 5 query exactly?
+Consensus: Use `queryDecisions({ query: "architecture" }, projectRoot)` as a broad demonstration query. If pack is empty, show static example.
 
-### D2: How is contradiction detection scoped deterministically?
-Can't know if code "contradicts" a decision without semantic understanding.
-**Recommendation:** Define "contradiction" as: file governed by active decision was structurally modified (not content-only). This is deterministic and doesn't require LLM inference.
+### D2: Should setup create CLAUDE.md if missing?
+Consensus: Yes, offer to create it. Use `confirm()`.
 
-### D3: Route detection across frameworks
-Next.js app router, Express, Remix, etc. all have different patterns.
-**Recommendation:** Use broad regex patterns that cover common conventions. Accept false positives — the inbox review step handles them.
+### D3: Monorepo support — wizard scope
+Both reviewers noted monorepo config fields are unused. This is intentional — v1 is single-repo. The wizard should not populate monorepo fields.
 
-### D4: ignore_paths matching model
-Prefix match? Glob? Regex?
-**Recommendation:** Prefix match on normalized paths. Same as existing behavior in config.ts.
-
-### D5: How should merge commits behave?
-**Recommendation:** Skip merge commits entirely (detect via `git rev-parse HEAD^2` succeeding). Merges are integration events, not decision events.
+### D4: Where to inject if no agent-guard block exists?
+If agent-guard is not present, append to end of file.
 
 ---
 
 ## SUGGESTED IMPROVEMENTS
 
-### I1: Consolidate git commands (Both)
-Use single `git diff-tree -z --root -r --name-status HEAD` to get status+paths in one call. Parse status letters (A/D/M/R) in JavaScript. Saves 2 execSync calls.
+### I1: Extract hook detection into shared module
+Move detection logic into `src/capture/detect-hooks.ts` or similar. Return `{ system: "husky"|"lefthook"|"simple-git-hooks"|"bare"|"none", path?: string }`. Both cli.ts and setup.ts call this.
 
-### I2: buildInboxItem helper (OpenAI)
-Centralize InboxItem construction with correct defaults. Prevents schema drift.
+### I2: Use `import.meta.url` for direct-run detection
+More reliable than `process.argv[1].endsWith()`.
 
-### I3: Sort and dedupe changed_files (OpenAI)
-Stable output helps testing and prevents duplicates from mixed inputs.
+### I3: Add `ensureConfigDir()` as first operation
+Call `mkdir(ledgerDir(projectRoot), { recursive: true })` before any config operations.
 
-### I4: Move no_capture_marker check earlier (Gemini)
-Check commit message before running git diff-tree commands. Saves execution time on skipped commits.
+### I4: Render DecisionPack as formatted summary, not raw JSON
+Format active precedents as bullet list with ID, summary, and weight.
+
+---
+
+## Cross-Check Results
+
+1. **Event types**: No new events — wizard is read/write config only. ✅
+2. **MCP tools**: No MCP changes — wizard calls queryDecisions for demo only. ✅
+3. **Lifecycle state machine**: Not affected. ✅
+4. **Auto-promotion threshold**: Not affected. ✅
+5. **Token budgeting**: Not affected (Step 5 demo is display-only). ✅
+6. **Standing instructions snippet**: Must be exact text from spec lines 553-576. ✅ (specified in guide)
+7. **Hook script template**: Must match cli.ts lines 401-405 exactly. ✅ (specified in guide)
+8. **Config structure**: Must match LedgerConfig type and DEFAULT_CONFIG. ✅ (using loadConfig + merge)

@@ -65,8 +65,8 @@ from 4 rounds of adversarial review.
 - **Scope Mappings**: File path to scope derivation rules
 - **Feature Hints**: Query expansion mappings for retrieval
 - **Environment Variables**: 
-  - `CONTEXT_LEDGER_PROJECT_ROOT`: Override default project root detection when running from outside project directory
-  - `CONTEXT_LEDGER_DEBUG`: Enable verbose hook stderr output for debugging
+  - `CONTEXT_LEDGER_PROJECT_ROOT`: Override default project root detection when running from outside project directory (used in cli.ts, mcp-server-bin.ts, and capture/hook.ts)
+  - `CONTEXT_LEDGER_DEBUG`: Enable verbose hook stderr output for debugging (used in capture/hook.ts)
 
 ## Ecosystem
 - agent-guard: Keeps the "what" accurate (inventories, doc sync, session context)

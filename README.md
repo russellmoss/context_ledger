@@ -243,8 +243,8 @@ Scope mappings let you give meaningful names to areas of your codebase. Without 
 
 The following environment variables can be used to configure context-ledger behavior:
 
-- `CONTEXT_LEDGER_PROJECT_ROOT`: Override the default project root detection when the tool is run from outside the project directory
-- `CONTEXT_LEDGER_DEBUG`: Enable verbose hook stderr output for debugging capture operations
+- `CONTEXT_LEDGER_PROJECT_ROOT`: Override the default project root detection when the tool is run from outside the project directory. Used in cli.ts, mcp-server-bin.ts, and capture/hook.ts.
+- `CONTEXT_LEDGER_DEBUG`: Enable verbose hook stderr output for debugging capture operations. Used in capture/hook.ts.
 
 See `context-ledger-design-v2.md` for the full config schema and all options.
 

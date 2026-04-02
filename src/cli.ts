@@ -25,6 +25,8 @@ import type {
 import { searchDecisions } from "./retrieval/index.js";
 import type { SearchResult } from "./retrieval/index.js";
 import { startMcpServer } from "./mcp-server.js";
+import { detectHookSystem } from "./capture/detect-hooks.js";
+import { runSetupWizard } from "./setup.js";
 
 // ── Argv Parsing ──────────────────────────────────────────────────────────────
 
@@ -404,73 +406,61 @@ async function installPostCommitHook(): Promise<void> {
 node -e "import('@mossrussell/context-ledger/dist/capture/hook.js').then(m => m.postCommit()).catch(() => {})" 2>/dev/null || true
 `;
 
-  // The line we check for to detect an existing context-ledger hook
   const marker = "context-ledger";
+  const result = await detectHookSystem(projectRoot);
 
-  // Check for Husky (.husky/)
-  const huskyDir = join(projectRoot, ".husky");
-  try {
-    await access(huskyDir);
-    const hookPath = join(huskyDir, "post-commit");
-    try {
-      await access(hookPath);
-      // Hook file exists — read it, check for marker, append if missing
-      const existing = await readFile(hookPath, "utf8");
-      if (!existing.includes(marker)) {
-        await writeFile(hookPath, existing.trimEnd() + "\n\n" + hookScript, { mode: 0o755 });
-        console.log("Appended context-ledger to existing .husky/post-commit");
-      } else {
+  switch (result.system) {
+    case "husky": {
+      const hookPath = result.hookPath!;
+      if (result.alreadyInstalled) {
         console.log("Husky post-commit hook already contains context-ledger, skipping.");
+        return;
       }
-    } catch {
-      // No existing hook file — create
-      await writeFile(hookPath, hookScript, { mode: 0o755 });
-      console.log("Installed post-commit hook via Husky (.husky/post-commit)");
+      try {
+        const existing = await readFile(hookPath, "utf8");
+        if (!existing.includes(marker)) {
+          await writeFile(hookPath, existing.trimEnd() + "\n\n" + hookScript, { mode: 0o755 });
+          console.log("Appended context-ledger to existing .husky/post-commit");
+        }
+      } catch {
+        await writeFile(hookPath, hookScript, { mode: 0o755 });
+        console.log("Installed post-commit hook via Husky (.husky/post-commit)");
+      }
+      break;
     }
-    return;
-  } catch { /* not husky */ }
-
-  // Check for Lefthook (lefthook.yml)
-  try {
-    await access(join(projectRoot, "lefthook.yml"));
-    console.log("Lefthook detected. Add the following to your lefthook.yml:");
-    console.log('  post-commit:\n    commands:\n      context-ledger:\n        run: node -e "import(\'@mossrussell/context-ledger/dist/capture/hook.js\').then(m => m.postCommit()).catch(() => {})"');
-    return;
-  } catch { /* not lefthook */ }
-
-  // Check for simple-git-hooks
-  try {
-    const pkg = JSON.parse(await readFile(join(projectRoot, "package.json"), "utf8"));
-    if (pkg["simple-git-hooks"]) {
+    case "lefthook": {
+      console.log("Lefthook detected. Add the following to your lefthook.yml:");
+      console.log('  post-commit:\n    commands:\n      context-ledger:\n        run: node -e "import(\'@mossrussell/context-ledger/dist/capture/hook.js\').then(m => m.postCommit()).catch(() => {})"');
+      break;
+    }
+    case "simple-git-hooks": {
       console.log("simple-git-hooks detected. Add to package.json:");
       console.log('  "simple-git-hooks": { "post-commit": "node -e \\"import(\'@mossrussell/context-ledger/dist/capture/hook.js\').then(m => m.postCommit()).catch(() => {})\\"" }');
-      return;
+      break;
     }
-  } catch { /* ignore */ }
-
-  // Bare .git/hooks/
-  const bareHookDir = join(projectRoot, ".git", "hooks");
-  try {
-    await access(bareHookDir);
-    const hookPath = join(bareHookDir, "post-commit");
-    try {
-      await access(hookPath);
-      // Hook already exists — append
-      const existing = await readFile(hookPath, "utf8");
-      if (!existing.includes(marker)) {
-        await writeFile(hookPath, existing.trimEnd() + "\n\n" + hookScript, { mode: 0o755 });
-        console.log("Appended context-ledger to existing .git/hooks/post-commit");
-      } else {
+    case "bare": {
+      const hookPath = result.hookPath!;
+      if (result.alreadyInstalled) {
         console.log("post-commit hook already contains context-ledger, skipping.");
+        return;
       }
-    } catch {
-      // No existing hook — create
-      await writeFile(hookPath, hookScript, { mode: 0o755 });
-      console.log("Installed post-commit hook to .git/hooks/post-commit");
+      try {
+        const existing = await readFile(hookPath, "utf8");
+        if (!existing.includes(marker)) {
+          await writeFile(hookPath, existing.trimEnd() + "\n\n" + hookScript, { mode: 0o755 });
+          console.log("Appended context-ledger to existing .git/hooks/post-commit");
+        }
+      } catch {
+        await writeFile(hookPath, hookScript, { mode: 0o755 });
+        console.log("Installed post-commit hook to .git/hooks/post-commit");
+      }
+      break;
     }
-  } catch {
-    console.error("Warning: Could not find .git/hooks/ directory. Hook not installed.");
-    console.error("Run 'context-ledger init' from your git repository root.");
+    case "none": {
+      console.error("Warning: Could not find .git/hooks/ directory. Hook not installed.");
+      console.error("Run 'context-ledger init' from your git repository root.");
+      break;
+    }
   }
 }
 
@@ -828,9 +818,7 @@ async function handleCapture(): Promise<void> {
 // ── setup ─────────────────────────────────────────────────────────────────────
 
 async function handleSetup(): Promise<void> {
-  console.error("Setup wizard is not yet implemented.");
-  console.error("Use 'context-ledger init' for basic initialization.");
-  process.exit(1);
+  await runSetupWizard(projectRoot);
 }
 
 // ── Entry Point ───────────────────────────────────────────────────────────────
