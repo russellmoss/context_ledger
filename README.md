@@ -64,7 +64,23 @@ npx context-ledger init
 
 This creates `.context-ledger/` with a default config, and installs a post-commit hook (auto-detects Husky, Lefthook, simple-git-hooks, or bare `.git/hooks/`).
 
-### 3. Register the MCP Server
+### 3. Run the Setup Wizard
+
+```bash
+npx context-ledger setup
+```
+
+The interactive wizard walks you through five steps:
+
+1. **Project Detection** — reads `package.json`, detects your tech stack, checks for agent-guard and council-mcp
+2. **Scope Mapping** — scans your source directories and generates `scope_mappings` and `feature_hint_mappings` for config
+3. **Hook Installation** — detects your hook system (Husky, Lefthook, simple-git-hooks, or bare) and installs the post-commit hook
+4. **Standing Instructions** — injects the context-ledger integration snippet into CLAUDE.md or .cursorrules
+5. **First-Run Demo** — shows what a decision pack looks like (or a live preview if you've already backfilled)
+
+You can also run `context-ledger init` followed by `context-ledger setup` separately. `init` handles the bare minimum; `setup` does guided configuration.
+
+### 4. Register the MCP Server
 
 For Claude Code:
 
@@ -74,7 +90,7 @@ claude mcp add --scope user context-ledger-mcp -- npx context-ledger-mcp
 
 For other MCP clients, point them at the `context-ledger-mcp` binary over stdio.
 
-### 4. Test It
+### 5. Test It
 
 Start a new Claude Code session and ask:
 
@@ -82,9 +98,15 @@ Start a new Claude Code session and ask:
 
 If your ledger is empty, you'll get back an empty pack. Time to capture your first decision.
 
-### 5. Capture Your First Decision
+### 6. Capture Your First Decision
 
 The fastest path: tell your AI agent to use `propose_decision` to draft a decision about something you've already established in your project. Then use `confirm_pending` to promote it to the ledger.
+
+Or capture manually from the CLI:
+
+```bash
+context-ledger capture 'All API responses use COALESCE with sensible defaults'
+```
 
 Or use the `record_writeback` tool during a normal feature workflow. When the agent makes a design choice during implementation, it writes that choice back to the ledger automatically.
 
@@ -102,6 +124,8 @@ The core loop is: **capture, store, fold, retrieve, compound.**
 
 **Compound.** Every decision you capture makes the next feature faster. The agent asks fewer questions because it already has precedent. It avoids dead ends because abandoned approaches are flagged. It reinforces good patterns because confirmed decisions get ranking boosts.
 
+**Drafter (v1.1+).** When the post-commit hook files a `draft_needed` inbox item, it also calls Claude Haiku to synthesize a `proposed_decision` from the commit diff, commit message, and up to ten existing precedents in the derived scope. Your next session sees a fully-drafted record to approve, edit, or reject instead of a blank form. Enabled by setting `ANTHROPIC_API_KEY` in the environment; the feature is a no-op (and the hook writes the same empty placeholder as before) when the key is absent. Cost is roughly **$0.01 per commit** with Haiku. Commits touching `.env*`, `credentials*`, `*.key`, or `*.pem` skip drafting entirely. Disable globally via `config.capture.drafter.enabled = false`, or override the model / timeout / diff budget via `config.capture.drafter.{ model, timeout_ms, max_diff_chars }`.
+
 ## MCP Tools
 
 ### Read
@@ -109,6 +133,7 @@ The core loop is: **capture, store, fold, retrieve, compound.**
 | Tool | Purpose |
 |------|---------|
 | `query_decisions` | Primary retrieval. Derives scope from file paths, config mappings, or query text. Returns a decision pack with active precedents, abandoned approaches, superseded history, and inbox items. Token-budgeted. |
+| `search_decisions` | Lexical search across all active decisions. Returns matching records sorted by effective rank score. Useful for CLI debugging and broad queries. |
 
 ### Write
 
@@ -145,14 +170,16 @@ context-ledger validate --propose-repair     # Suggest repairs without modifying
 
 ```bash
 context-ledger init                          # Create .context-ledger/, config, post-commit hook
+context-ledger capture '<summary>'           # Interactively capture a convention or decision
 context-ledger tidy                          # Remove stale inbox entries older than 30 days
 context-ledger backfill --max 5              # Backfill structural commits from git history
 context-ledger backfill --resume             # Resume interrupted backfill
 ```
 
-### Other
+### Setup & Server
 
 ```bash
+context-ledger setup                         # Interactive setup wizard (@clack/prompts)
 context-ledger serve                         # Start MCP server over stdio
 context-ledger --help                        # Full command list
 context-ledger --version                     # Package version
@@ -215,29 +242,47 @@ npm install --save-dev @mossrussell/agent-guard @mossrussell/context-ledger coun
 
 ## Configuration
 
-`context-ledger init` creates `.context-ledger/config.json` with sensible defaults:
+`context-ledger init` creates `.context-ledger/config.json` with sensible defaults. `context-ledger setup` generates scope mappings and feature hints interactively.
 
 ```jsonc
 {
   "capture": {
     "enabled": true,
     "ignore_paths": ["dist/", "node_modules/", ".next/", "coverage/"],
-    "scope_mappings": {},          // Map file paths to named scopes
+    "scope_mappings": {            // Map file path prefixes to named scopes
+      "src/auth/": { "type": "domain", "id": "auth" }
+    },
+    "redact_patterns": [],         // Regex patterns to strip from captured diffs
     "no_capture_marker": "[no-capture]",
     "inbox_ttl_days": 14,
-    "inbox_max_prompts_per_item": 3
+    "inbox_max_prompts_per_item": 3,
+    "inbox_max_items_per_session": 3
   },
   "retrieval": {
     "default_limit": 20,
     "include_superseded": false,
+    "include_unreviewed": false,
     "auto_promotion_min_weight": 0.7,
     "token_budget": 4000,
-    "feature_hint_mappings": {}    // Map keywords to scope IDs
+    "feature_hint_mappings": {     // Map keywords to scope IDs for query hints
+      "auth": ["auth"]
+    }
+  },
+  "workflow_integration": {
+    "selective_writeback": true,
+    "check_inbox_on_session_start": true,
+    "jit_backfill": true
+  },
+  "monorepo": {
+    "package_name": null,          // Reserved for future monorepo support
+    "root_relative_path": null
   }
 }
 ```
 
-Scope mappings let you give meaningful names to areas of your codebase. Without them, scope is derived from directory names. With them, `src/ledger/` maps to `domain/ledger-core` and queries become much more precise.
+**Scope mappings** let you give meaningful names to areas of your codebase. Without them, scope is derived from directory names. With them, `src/ledger/` maps to `domain/ledger-core` and queries become much more precise. The `setup` wizard generates these automatically from your directory structure.
+
+**Feature hint mappings** let `query_decisions` resolve natural language queries like "auth" to the right scope, even when no file path is provided.
 
 ## Environment Variables
 

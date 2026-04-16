@@ -95,6 +95,7 @@ async function test1_fullPipeline(): Promise<string> {
       inbox_ttl_days: 14,
       inbox_max_prompts_per_item: 3,
       inbox_max_items_per_session: 3,
+      drafter: { enabled: false },
     },
     retrieval: {
       default_limit: 20,
@@ -236,6 +237,7 @@ async function test3_configLoading(): Promise<string> {
       inbox_ttl_days: 14,
       inbox_max_prompts_per_item: 3,
       inbox_max_items_per_session: 3,
+      drafter: { enabled: false },
     },
     retrieval: {
       default_limit: 20,

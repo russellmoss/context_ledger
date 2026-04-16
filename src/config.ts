@@ -12,6 +12,13 @@ export interface ScopeMapping {
   id: string;
 }
 
+export interface DrafterCaptureConfig {
+  enabled: boolean;
+  model?: string;
+  timeout_ms?: number;
+  max_diff_chars?: number;
+}
+
 export interface LedgerConfig {
   capture: {
     enabled: boolean;
@@ -22,6 +29,7 @@ export interface LedgerConfig {
     inbox_ttl_days: number;
     inbox_max_prompts_per_item: number;
     inbox_max_items_per_session: number;
+    drafter: DrafterCaptureConfig;
   };
   retrieval: {
     default_limit: number;
@@ -54,6 +62,7 @@ export const DEFAULT_CONFIG: LedgerConfig = {
     inbox_ttl_days: 14,
     inbox_max_prompts_per_item: 3,
     inbox_max_items_per_session: 3,
+    drafter: { enabled: true },
   },
   retrieval: {
     default_limit: 20,

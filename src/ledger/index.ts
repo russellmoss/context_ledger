@@ -16,6 +16,7 @@ export type {
   DecisionRecord,
   TransitionEvent,
   InboxItem,
+  ProposedDecisionDraft,
 } from "./events.js";
 
 export {

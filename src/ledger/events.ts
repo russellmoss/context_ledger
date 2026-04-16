@@ -75,6 +75,16 @@ export interface TransitionEvent {
   source_feature_id: string | null;
 }
 
+export interface ProposedDecisionDraft {
+  summary: string;
+  decision: string;
+  rationale: string;
+  alternatives_considered: AlternativeConsidered[];
+  decision_kind: string;
+  tags: string[];
+  durability: Durability;
+}
+
 export interface InboxItem {
   inbox_id: string;
   type: InboxType;
@@ -89,6 +99,7 @@ export interface InboxItem {
   times_shown: number;
   last_prompted_at: string | null;
   status: InboxStatus;
+  proposed_decision?: ProposedDecisionDraft;
 }
 
 // ── Union Type ────────────────────────────────────────────────────────────────

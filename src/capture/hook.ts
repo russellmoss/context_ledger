@@ -2,15 +2,17 @@
 // Post-commit hook entry point. Must complete under 100ms. Never blocks git commits.
 // All output to stderr. Zero LLM calls. Zero network calls.
 
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { stat } from "node:fs/promises";
-import type { InboxItem } from "../ledger/index.js";
+import type { FoldedDecision, InboxItem, ProposedDecisionDraft } from "../ledger/index.js";
 import { generateInboxId, appendToInbox, foldLedger, ledgerPath } from "../ledger/index.js";
 import { loadConfig } from "../config.js";
 import type { LedgerConfig } from "../config.js";
 import { deriveScope } from "../retrieval/index.js";
+import type { DerivedScope } from "../retrieval/index.js";
 import { classifyCommit } from "./classify.js";
 import type { ClassifyResult, ParsedPackageJson } from "./classify.js";
+import { synthesizeDraft } from "./drafter.js";
 
 // ── Debug ────────────────────────────────────────────────────────────────────
 
@@ -37,8 +39,9 @@ function buildInboxItem(
   redactedMessage: string,
   diffSummary: string,
   config: LedgerConfig,
+  proposedDecision?: ProposedDecisionDraft,
 ): InboxItem {
-  return {
+  const item: InboxItem = {
     inbox_id: generateInboxId(),
     type: result.inbox_type,
     created: new Date().toISOString(),
@@ -53,6 +56,50 @@ function buildInboxItem(
     last_prompted_at: null,
     status: "pending",
   };
+  if (proposedDecision) item.proposed_decision = proposedDecision;
+  return item;
+}
+
+// ── Drafter helpers ──────────────────────────────────────────────────────────
+
+const SENSITIVE_PATH_PATTERN = /(^|\/)(\.env($|\..+)|credentials(\..+)?|.+\.(key|pem))($|\/)/i;
+
+function hasSensitivePath(files: string[]): boolean {
+  return files.some((f) => SENSITIVE_PATH_PATTERN.test(f));
+}
+
+function getCommitDiff(projectRoot: string, sha: string, files: string[]): string {
+  if (files.length === 0) return "";
+  try {
+    return execFileSync(
+      "git",
+      ["show", "--unified=3", "--no-color", sha, "--", ...files],
+      { cwd: projectRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024 },
+    );
+  } catch {
+    return "";
+  }
+}
+
+function precedentsForScope(
+  decisions: Map<string, FoldedDecision>,
+  scope: DerivedScope | null,
+  limit = 10,
+): Array<{ summary: string; decision: string }> {
+  if (!scope) return [];
+  const hits: Array<{ summary: string; decision: string; created: string }> = [];
+  for (const folded of decisions.values()) {
+    if (folded.state !== "active") continue;
+    if (folded.record.verification_status !== "confirmed") continue;
+    if (folded.record.scope.type !== scope.type || folded.record.scope.id !== scope.id) continue;
+    hits.push({
+      summary: folded.record.summary,
+      decision: folded.record.decision,
+      created: folded.record.created,
+    });
+  }
+  hits.sort((a, b) => b.created.localeCompare(a.created));
+  return hits.slice(0, limit).map(({ summary, decision }) => ({ summary, decision }));
 }
 
 function buildDiffSummary(
@@ -256,19 +303,21 @@ export async function postCommit(): Promise<void> {
     }
     debug(`classified: ${results.length} results`);
 
-    // 9. Tier 2 contradiction detection — best effort
+    // 9. Tier 2 contradiction detection — best effort.
+    //    Also reuse the folded state for the drafter's precedent lookup.
+    let foldedState: Awaited<ReturnType<typeof foldLedger>> | null = null;
     try {
       const ledgerFile = ledgerPath(projectRoot);
       const stats = await stat(ledgerFile).catch(() => null);
       if (stats && stats.size < 100 * 1024) {
-        const state = await foldLedger(projectRoot);
+        foldedState = await foldLedger(projectRoot);
         for (let i = 0; i < results.length; i++) {
           const r = results[i];
           if (r.tier === 1) {
             for (const f of r.changed_files) {
-              const derived = deriveScope({ file_path: f }, config, state.decisions);
+              const derived = deriveScope({ file_path: f }, config, foldedState.decisions);
               if (derived) {
-                for (const [, folded] of state.decisions) {
+                for (const [, folded] of foldedState.decisions) {
                   if (
                     folded.state === "active" &&
                     folded.record.scope.type === derived.type &&
@@ -297,12 +346,62 @@ export async function postCommit(): Promise<void> {
     const redactedMessage = redact(subject, config.capture.redact_patterns);
     const extras = { packageJsonDiff: pkgDiff, envVarChanges: envChanges };
 
+    const drafterEnabled = config.capture.drafter.enabled !== false;
+    const apiKey = process.env.ANTHROPIC_API_KEY ?? null;
+    let drafterSkipLoggedForMissingKey = false;
+
     for (const result of results) {
       const rawSummary = buildDiffSummary(result, extras);
       const redactedSummary = redact(rawSummary, config.capture.redact_patterns);
-      const item = buildInboxItem(result, sha, redactedMessage, redactedSummary, config);
+
+      let proposed: ProposedDecisionDraft | undefined;
+
+      if (result.inbox_type === "draft_needed" && drafterEnabled) {
+        if (!apiKey) {
+          if (!drafterSkipLoggedForMissingKey) {
+            console.error(
+              "[context-ledger:drafter] ANTHROPIC_API_KEY not set — skipping draft synthesis",
+            );
+            drafterSkipLoggedForMissingKey = true;
+          }
+        } else if (hasSensitivePath(result.changed_files)) {
+          console.error(
+            "[context-ledger:drafter] sensitive path detected in changed files — skipping draft",
+          );
+        } else {
+          const derived = deriveScope(
+            { file_path: result.changed_files[0] },
+            config,
+            foldedState?.decisions ?? new Map(),
+          );
+          const precedents = precedentsForScope(
+            foldedState?.decisions ?? new Map(),
+            derived,
+          );
+          const rawDiff = getCommitDiff(projectRoot, sha, result.changed_files);
+          const draft = await synthesizeDraft({
+            commitSha: sha,
+            commitMessage: fullBody,
+            changeCategory: result.change_category,
+            changedFiles: result.changed_files,
+            diff: rawDiff,
+            existingPrecedents: precedents,
+            config: {
+              apiKey,
+              model: config.capture.drafter.model,
+              timeoutMs: config.capture.drafter.timeout_ms,
+              maxDiffChars: config.capture.drafter.max_diff_chars,
+            },
+          });
+          if (draft) proposed = draft;
+        }
+      }
+
+      const item = buildInboxItem(result, sha, redactedMessage, redactedSummary, config, proposed);
       await appendToInbox(item, projectRoot);
-      console.error(`[context-ledger] Captured ${result.change_category} (${result.inbox_type})`);
+      console.error(
+        `[context-ledger] Captured ${result.change_category} (${result.inbox_type})${proposed ? " +draft" : ""}`,
+      );
     }
   } catch (err: unknown) {
     debug(`Hook error (non-fatal): ${err instanceof Error ? err.message : String(err)}`);

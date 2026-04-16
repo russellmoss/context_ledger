@@ -27,7 +27,7 @@ from 4 rounds of adversarial review.
 
 ## Module Map
 - src/ledger/ — Event types, fold logic, inbox management, validation, storage operations
-- src/capture/ — Post-commit hook, change classification (classify.ts, hook.ts, index.ts)
+- src/capture/ — Post-commit hook, change classification, LLM drafter (classify.ts, hook.ts, drafter.ts, index.ts)
 - src/retrieval/ — query_decisions implementation, scope derivation, decision pack builder
 - src/mcp/ — MCP tool registrations (read + write tools with Zod validation)
 - src/cli.ts — CLI commands (init, serve, validate, tidy, stats, export, backfill, query)
@@ -57,9 +57,10 @@ from 4 rounds of adversarial review.
 
 ### Capture System
 - **Classifier** (classify.ts): Deterministic commit classifier with 9 Tier 1 categories (dependency-addition, dependency-removal, env-var-change, new-directory, file-deletion, config-change, api-route-change, page-route-change, schema-change) and 4 Tier 2 categories (module-replacement, auth-security-change, db-migration-switch, feature-removal). `AUTH_FILE_PATTERN` requires compound forms (`session-store`, `session-manager`, `auth-session`, `session-cookie`) to avoid false positives on bare "session" filenames. API routes (`app/api`, `pages/api`, `src/routes`) and Next.js page routes (`page.tsx`) are classified independently, with files claimed by one result excluded from the other. Supports package.json content diff parsing for accurate dependency detection. 3-item cap per commit with Tier 2 priority.
-- **Hook** (hook.ts): Post-commit entry point executing under 100ms. Single `git diff-tree --no-commit-id --root -r --name-status -z HEAD` for NUL-delimited output parsing, merge commit skipping, path normalization, Tier 2 contradiction detection (best-effort with foldLedger size gate), redaction via config patterns, and append-only inbox writes. Debug output via CONTEXT_LEDGER_DEBUG env var.
+- **Hook** (hook.ts): Post-commit entry point. Single `git diff-tree --no-commit-id --root -r --name-status -z HEAD` for NUL-delimited output parsing, merge commit skipping, path normalization, Tier 2 contradiction detection (best-effort with foldLedger size gate), redaction via config patterns, and append-only inbox writes. For every `draft_needed` result the hook also invokes the LLM drafter (see below) with the commit diff via `git show --unified=3 <sha> -- <files>` and attaches the returned `proposed_decision` to the inbox record. Commits touching `.env*`, `credentials*`, `*.key`, `*.pem` skip draft synthesis entirely. Debug output via CONTEXT_LEDGER_DEBUG env var.
+- **Drafter** (drafter.ts): Calls Claude Haiku (`claude-haiku-4-5-20251001` by default) via the Anthropic SDK with `tool_choice` forcing a single `propose_decision` tool call, producing a structured `ProposedDecision`. Reads the API key from `process.env.ANTHROPIC_API_KEY` only (never from config.json). Returns `null` on missing key, timeout, rate limit, auth failure, schema validation failure, or any other error — never throws. Diff is truncated to `max_diff_chars` (default 8000) with a `...[truncated]` marker. All errors logged to stderr under `[context-ledger:drafter]`.
 - **Exports** (index.ts): Barrel exports for ClassifyResult, ParsedPackageJson, classifyCommit, postCommit.
-- **Smoke tests** (smoke-test.ts): Standalone script verifying classifier invariants — bare "session" does not trigger auth, compound forms do, page.tsx and api routes produce separate results without double-claiming files.
+- **Tests** (smoke-test.ts / drafter.test.ts / hook.test.ts): Standalone Node scripts. Classifier smoke verifies bare "session" does not trigger auth, compound forms do, page.tsx and api routes produce separate results without double-claiming files. Drafter unit tests cover null-apiKey short-circuit, successful tool_use parsing, error swallowing, and diff truncation (Anthropic SDK mocked by patching `Messages.prototype.create`). Hook integration tests spin up a temp git repo and assert that `draft_needed` inbox items gain a `proposed_decision` when the drafter returns one and omit the field when the API key is absent.
 
 ### Configuration System
 - **Deep Merge**: Hierarchical config loading with type-safe defaults
@@ -68,6 +69,7 @@ from 4 rounds of adversarial review.
 - **Environment Variables**: 
   - `CONTEXT_LEDGER_PROJECT_ROOT`: Override default project root detection when running from outside project directory (used in cli.ts, mcp-server-bin.ts, and capture/hook.ts)
   - `CONTEXT_LEDGER_DEBUG`: Enable verbose hook stderr output for debugging (used in capture/hook.ts)
+  - `ANTHROPIC_API_KEY`: Enables the LLM drafter. When set, the post-commit hook calls Claude Haiku to synthesize a `proposed_decision` for each `draft_needed` inbox item. Feature degrades to a no-op when unset. Read only from the environment — never from config.json (used in capture/drafter.ts via capture/hook.ts).
 
 ## Ecosystem
 - agent-guard: Keeps the "what" accurate (inventories, doc sync, session context)
