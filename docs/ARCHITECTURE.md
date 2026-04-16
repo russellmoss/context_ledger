@@ -56,9 +56,10 @@ from 4 rounds of adversarial review.
 - **Statistics**: Decision analytics with grouping by source, kind, scope, evidence, and lifecycle state
 
 ### Capture System
-- **Classifier** (classify.ts): Deterministic commit classifier with 8 Tier 1 categories (dependency-addition, dependency-removal, env-var-change, new-directory, file-deletion, config-change, api-route-change, schema-change) and 4 Tier 2 categories (module-replacement, auth-security-change, db-migration-switch, feature-removal). Supports package.json content diff parsing for accurate dependency detection. 3-item cap per commit with Tier 2 priority.
+- **Classifier** (classify.ts): Deterministic commit classifier with 9 Tier 1 categories (dependency-addition, dependency-removal, env-var-change, new-directory, file-deletion, config-change, api-route-change, page-route-change, schema-change) and 4 Tier 2 categories (module-replacement, auth-security-change, db-migration-switch, feature-removal). `AUTH_FILE_PATTERN` requires compound forms (`session-store`, `session-manager`, `auth-session`, `session-cookie`) to avoid false positives on bare "session" filenames. API routes (`app/api`, `pages/api`, `src/routes`) and Next.js page routes (`page.tsx`) are classified independently, with files claimed by one result excluded from the other. Supports package.json content diff parsing for accurate dependency detection. 3-item cap per commit with Tier 2 priority.
 - **Hook** (hook.ts): Post-commit entry point executing under 100ms. Single `git diff-tree --no-commit-id --root -r --name-status -z HEAD` for NUL-delimited output parsing, merge commit skipping, path normalization, Tier 2 contradiction detection (best-effort with foldLedger size gate), redaction via config patterns, and append-only inbox writes. Debug output via CONTEXT_LEDGER_DEBUG env var.
 - **Exports** (index.ts): Barrel exports for ClassifyResult, ParsedPackageJson, classifyCommit, postCommit.
+- **Smoke tests** (smoke-test.ts): Standalone script verifying classifier invariants — bare "session" does not trigger auth, compound forms do, page.tsx and api routes produce separate results without double-claiming files.
 
 ### Configuration System
 - **Deep Merge**: Hierarchical config loading with type-safe defaults

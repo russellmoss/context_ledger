@@ -57,7 +57,7 @@ function isIgnored(p: string, ignorePaths: string[]): boolean {
 // ── Tier 2 Detectors ─────────────────────────────────────────────────────────
 
 const AUTH_SECURITY_PATTERN = /\b(auth|middleware|permissions|security)\b/;
-const AUTH_FILE_PATTERN = /\b(credentials|oauth|jwt|session)\b/i;
+const AUTH_FILE_PATTERN = /\b(credentials|oauth|jwt|session-store|session-manager|auth-session|session-cookie)\b/i;
 
 function detectModuleReplacement(
   deleted: string[],
@@ -332,18 +332,34 @@ export function classifyCommit(
     });
   }
 
-  // API route changes
-  const routeFiles = all.filter((f) => {
+  // API route changes (Next.js app/api, pages/api, generic src/routes)
+  const apiRouteFiles = all.filter((f) => {
     const n = normLower(f);
-    return (ROUTE_PATTERN.test(n) || /page\.(tsx?|jsx?)$/.test(n)) && !claimedFiles.has(f);
+    return ROUTE_PATTERN.test(n) && !claimedFiles.has(f);
   });
-  if (routeFiles.length > 0) {
+  if (apiRouteFiles.length > 0) {
     results.push({
       tier: 1,
       change_category: "api-route-change",
       inbox_type: "draft_needed",
-      changed_files: dedup(routeFiles),
+      changed_files: dedup(apiRouteFiles),
     });
+    apiRouteFiles.forEach((f) => claimedFiles.add(f));
+  }
+
+  // Page route changes (Next.js App Router page.tsx / Pages Router page.tsx)
+  const pageRouteFiles = all.filter((f) => {
+    const n = normLower(f);
+    return /page\.(tsx?|jsx?)$/.test(n) && !claimedFiles.has(f);
+  });
+  if (pageRouteFiles.length > 0) {
+    results.push({
+      tier: 1,
+      change_category: "page-route-change",
+      inbox_type: "draft_needed",
+      changed_files: dedup(pageRouteFiles),
+    });
+    pageRouteFiles.forEach((f) => claimedFiles.add(f));
   }
 
   // Schema changes

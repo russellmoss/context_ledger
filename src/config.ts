@@ -47,7 +47,7 @@ export interface LedgerConfig {
 export const DEFAULT_CONFIG: LedgerConfig = {
   capture: {
     enabled: true,
-    ignore_paths: ["dist/", "node_modules/", ".next/", "coverage/"],
+    ignore_paths: ["dist/", "node_modules/", ".next/", "coverage/", ".agent-guard/", ".cursor/", ".claude/"],
     scope_mappings: {},
     redact_patterns: [],
     no_capture_marker: "[no-capture]",
