@@ -290,6 +290,7 @@ The following environment variables can be used to configure context-ledger beha
 
 - `CONTEXT_LEDGER_PROJECT_ROOT`: Override the default project root detection when the tool is run from outside the project directory. Used in cli.ts, mcp-server-bin.ts, and capture/hook.ts.
 - `CONTEXT_LEDGER_DEBUG`: Enable verbose hook stderr output for debugging capture operations. Used in capture/hook.ts.
+- `ANTHROPIC_API_KEY`: Enables the LLM drafter feature. When set, the post-commit hook calls Claude Haiku to synthesize a `proposed_decision` for each `draft_needed` inbox item. Feature degrades gracefully to a no-op when unset. Read only from the environment — never from config.json. Used in capture/drafter.ts via capture/hook.ts.
 
 See `context-ledger-design-v2.md` for the full config schema and all options.
 
