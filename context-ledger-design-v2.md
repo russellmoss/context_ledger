@@ -1,8 +1,8 @@
-# context-ledger: Design Document v2.3
+# context-ledger: Design Document v2.4
 
 ## What This Document Is
 
-This is the design specification for `context-ledger`, an npm package for capturing and retrieving architectural decision history in AI-assisted development workflows. This is v2.3, revised after four rounds of adversarial review by GPT and Gemini with human arbitration. v2 changes are noted with "v2 change". v2.1 changes from Round 2 review are noted with "v2.1". v2.2 changes from Round 3 review are noted with "v2.2". v2.3 changes from Round 4 review are noted with "v2.3".
+This is the design specification for `context-ledger`, an npm package for capturing and retrieving architectural decision history in AI-assisted development workflows. This is v2.4, revised after five rounds of adversarial review by GPT, Gemini, and Codex with human arbitration. v2 changes are noted with "v2 change". v2.1 changes from Round 2 review are noted with "v2.1". v2.2 changes from Round 3 review are noted with "v2.2". v2.3 changes from Round 4 review are noted with "v2.3". v2.4 changes from Round 5 review are noted with "v2.4".
 
 **Target user:** Solo developer building with AI coding agents (Claude Code, Cursor, Windsurf). Team support is a future concern, not a v1 goal.
 
@@ -502,6 +502,7 @@ Parameters:
 - `tags` (string[], optional) — filter by tags
 - `include_superseded` (boolean, optional, default false)
 - `include_unreviewed` (boolean, optional, default false)
+- `include_feature_local` (boolean, optional, default false) — **v2.4:** opt in to `feature-local` durability records across every section of the decision pack. Bypasses the default file-path-match requirement globally.
 - `limit` (number, optional, default 20)
 - `offset` (number, optional, default 0) — for paginating when previous query returned `truncated: true`. Allows agent to retrieve records beyond the token budget cutoff.
 
@@ -526,13 +527,50 @@ Returns a decision pack with per-item match explanations and token budgeting:
   "abandoned_approaches": [...],         // with pain_points, same match_reason format
   "recently_superseded": [...],          // superseded in last 90 days
   "pending_inbox_items": [...],          // unresolved inbox entries for this scope
+  "mistakes_in_scope": [...],            // v2.4: antipatterns surfaced FIRST under token pressure
   "no_precedent_scopes": [...],          // queried scopes with zero trusted matches
   "token_estimate": 1847,               // approximate token count of the full pack
   "truncated": false                     // true if pack exceeded budget and was trimmed
 }
 ```
 
-**Token budgeting (v2.1 addition):** Decision packs must not recreate the context bloat problem they exist to solve. The server enforces a configurable token budget (default: 4000 tokens per pack). If the filtered result set exceeds the budget, records are trimmed by priority: active precedents first, then abandoned approaches, then superseded history. The `truncated` flag signals the agent that additional relevant records exist.
+**Token budgeting (v2.1 addition, v2.4 revision):** Decision packs must not recreate the context bloat problem they exist to solve. The server enforces a configurable token budget (default: 4000 tokens per pack). If the filtered result set exceeds the budget, records are trimmed in this priority order (first to drop → last to drop): `active_precedents` (popped from the tail, lowest effective_rank_score first) → `recently_superseded` (dropped entirely) → `abandoned_approaches` (dropped entirely) → `pending_inbox_items` (capped at `inbox_max_items_per_session`, then popped from tail) → `mistakes_in_scope` (last casualty, popped from tail). The `truncated` flag is set once on entering the trim block and never reset. See the **mistakes_in_scope (v2.4 addition)** subsection below for the rationale.
+
+### mistakes_in_scope (v2.4 addition)
+
+**What it is.** A dedicated array of antipatterns surfaced before active precedents so token-truncated packs retain the highest-signal-per-token data: what *not* to do. Active precedents describe current-state rationale; mistakes describe known failure modes that must not be repeated. Under token pressure, "don't do X because it broke prod" is cheaper and more actionable than a full statement of current convention.
+
+**Three entry kinds** (discriminated union on `kind`):
+
+1. **`superseded_with_pain_points`** — a decision in the `superseded` state whose supersede transition carried a non-empty `pain_points` array. Fields: `record`, `match_reason`, `pain_points[]`, `replaced_by`.
+2. **`abandoned`** — a decision in the `abandoned` state. Fields: `record`, `match_reason`, `reason` (from the abandon transition), `pain_points[]` (may be empty).
+3. **`rejected_inbox_item`** — a dismissed inbox item with a non-empty `rejection_reason`. Fields: `inbox_id`, `commit_sha`, `commit_message`, `changed_files[]`, `rejection_reason`, `rejected_at`.
+
+Sort order: by kind (1 → 2 → 3), then by recency descending within each kind.
+
+**Sources — retrieval-contract extension only.** `mistakes_in_scope` is populated entirely from the existing fold output plus dismissed inbox items. It introduces no new event types, no new transitions, and no new JSONL shape. `DecisionRecord` and `TransitionEvent` schemas are **untouched**; the fold-logic audit confirms zero event-schema change. This is a retrieval-layer addition.
+
+**Exclusions:**
+- `commit_inferred` records (retrieval weight 0.2) are excluded from `mistakes_in_scope` even in `abandoned` or `superseded` state. Unreviewed inferences never drive agent behavior — including as antipatterns. They remain in `abandoned_approaches` / `recently_superseded` as informational context only. This asymmetric treatment is intentional.
+- `feature-local` durability records are excluded by default. Pass `include_feature_local: true` to opt in. The flag is a global short-circuit — it bypasses the existing feature-local file-path-match requirement for **every** section of the decision pack, not only `mistakes_in_scope`.
+
+**Deduplication.** Records promoted into `mistakes_in_scope` are removed from `abandoned_approaches` and `recently_superseded`. This prevents token-budget double-counting that would trigger premature trimming of the bucket we most want to preserve.
+
+**Trim priority (user-locked, spec-literal).** Under token pressure, the trim sequence is: `active_precedents` (pop from tail) → `recently_superseded` (drop) → `abandoned_approaches` (drop) → `pending_inbox_items` (cap, then pop) → `mistakes_in_scope` (pop from tail). A heavily truncated pack can legitimately return `active_precedents.length === 0` alongside a full `mistakes_in_scope`. That is the intentional "antipatterns > active precedents under token pressure" bet: the agent can re-query with offset paging to retrieve trimmed active precedents, but cannot recover antipatterns that were never surfaced in the first place.
+
+**Scope rules.** Same derivation paths as `active_precedents`:
+1. Explicit `scope_type` + `scope_id`.
+2. `file_path` → `scope_mappings` (longest-prefix match) → `scope_aliases` on active decisions → directory fallback (segment after `src/`).
+3. `feature_hint_mappings` phrase match against `query`.
+4. Recency fallback (`derivedScope === null`).
+
+For rejected inbox items: `changed_files` must intersect the derived scope via the same order (scope_mappings → scope_aliases → directory fallback). Empty `changed_files` falls back to substring match of `scope.id` against `commit_message`.
+
+**Recency fallback behavior.** When `derivedScope === null`, `mistakes_in_scope` includes the **N=10** most recent dismissed inbox items with `rejection_reason`, sorted by `rejected_at` descending. Decisions in `abandoned`/`superseded` state are surfaced via the existing `broad_fallback` match path and classified into `mistakes_in_scope` exactly as in the scoped case (subject to `commit_inferred` exclusion).
+
+**CLI render.** `context-ledger query <text>` now calls `queryDecisions` (replacing `searchDecisions`) and renders the full decision pack. The "Prior mistakes in this scope" section is emitted first, before active precedents. This makes the CLI a faithful debugging mirror of what the agent sees over MCP.
+
+**Tidy interaction.** Rejected-inbox mistakes are subject to the existing 30-day `tidyInbox` TTL. Dismissed items older than 30 days are removed by `context-ledger tidy` and can no longer surface in `mistakes_in_scope`.
 
 **Scope mapping fallback (v2.1 addition):** Gemini flagged that developers will map 4 directories on day one and never update `scope_mappings` again. If a file path doesn't match any explicit mapping, the server falls back to the top-level directory name as scope ID (e.g., `src/app/billing/handler.ts` → scope `{ type: "directory", id: "billing" }`). Explicit mappings override the fallback but are not required.
 
@@ -899,6 +937,12 @@ These are the arbitrated outcomes from adversarial review. v2 decisions are from
 | **v2.3: Interactive setup wizard** | Setup should be guided and delightful, not a flat CLI command. Auto-generates scope_mappings from project structure. Matches council-mcp-setup UX pattern. | Arbiter |
 | **v2.3: Guided area-based backfill** | Backfill grouped by scope area with save/resume, not a flat chronological chore. Developer stops anytime. | Arbiter |
 | **v2.3: First-run demo after setup** | Show the developer what their agent will see. Immediate value demonstration closes the "why should I bother" gap. | Arbiter |
+| **v2.4: `mistakes_in_scope` in decision pack** | Antipatterns (abandoned, superseded with pain_points, rejected inbox items) are the highest-signal-per-token data for preventing repeats. Surfaced first in the pack and last to be trimmed under token pressure. Retrieval-contract extension only — no new event types. | Arbiter (user triage, council pass 1 — Gemini + Codex) |
+| **v2.4: Option A trim order — mistakes last** | Literal spec reading: `active_precedents` (from tail) → `recently_superseded` → `abandoned_approaches` → `pending_inbox_items` (cap + pop) → `mistakes_in_scope` last. A heavily truncated pack can return all mistakes and zero active precedents; this is intentional. | Arbiter (user triage) |
+| **v2.4: `include_feature_local` query parameter** | Boolean flag that opts into `feature-local` durability records across every section of the decision pack. Bypasses the default file-path-match requirement globally. | Arbiter (user triage) |
+| **v2.4: Recency-fallback rejected-inbox cap** | When scope derivation returns null, include the N=10 most recent dismissed inbox items with `rejection_reason`, sorted by `rejected_at` desc. Honors "apply to every scope-derivation path" contract. | Arbiter (user triage) |
+| **v2.4: `rejection_reason` ratified as typed optional field on `InboxItem`** | Previously persisted via out-of-schema dynamic cast at `write-tools.ts:261`. Promoted to `rejection_reason?: string` on the documented `InboxItem` interface; dynamic cast removed. Rationale: eliminates the cast and lets retrieval consume the field with full type safety. **Not an event-schema change** — `InboxItem` is a workflow queue entry, distinct from `DecisionRecord` / `TransitionEvent`. Append-only invariant applies to `ledger.jsonl` events; `inbox.jsonl` already uses atomic `rewriteInbox` for terminal-state transitions. Backward compatible: pre-ratification items parse correctly under the new typed interface (optional field, existing values persist). | Arbiter (user triage, council pass 1) |
+| **v2.4: CLI `query` replaces `searchDecisions` with `queryDecisions`** | Single retrieval path for both MCP and CLI. CLI renders the full decision pack (mistakes first, then active, abandoned, superseded, inbox). The CLI becomes a faithful debugging mirror of what the agent sees. `searchDecisions` retained as a library export for other callers. | Arbiter (user triage) |
 
 ---
 

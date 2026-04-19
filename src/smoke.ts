@@ -338,6 +338,42 @@ async function test5_reinforceWeight(): Promise<string> {
   return tmpDir;
 }
 
+// ── Test 6: mistakes_in_scope populated from abandoned decision ──────────────
+
+async function test6_mistakesInScope(): Promise<string> {
+  console.error("\nTest 6: mistakes_in_scope populated by abandoned decision with pain_points");
+
+  const tmpDir = await setupTempProject();
+
+  const d = makeDecision({
+    id: generateDecisionId(),
+    evidence_type: "explicit_manual",
+    durability: "precedent",
+    scope: { type: "domain", id: "retrieval" },
+    summary: "Tried streaming fold; abandoned",
+  });
+  await appendToLedger(d, tmpDir);
+  await appendToLedger(
+    makeTransition({
+      target_id: d.id,
+      action: "abandon",
+      reason: "streaming fold was too complex",
+      pain_points: ["unbounded memory", "hard to debug"],
+    }),
+    tmpDir,
+  );
+
+  const pack = await queryDecisions({ scope_type: "domain", scope_id: "retrieval" }, tmpDir);
+  assert(pack.mistakes_in_scope.length === 1, `mistakes_in_scope.length === 1 (got ${pack.mistakes_in_scope.length})`);
+  const m = pack.mistakes_in_scope[0];
+  assert(m.kind === "abandoned", `kind === abandoned (got ${m.kind})`);
+  if (m.kind === "abandoned") {
+    assert(m.pain_points.includes("unbounded memory"), "pain_points round-trips through the pack");
+  }
+
+  return tmpDir;
+}
+
 // ── Runner ───────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -352,6 +388,7 @@ async function main(): Promise<void> {
       test3_configLoading,
       test4_searchDecisions,
       test5_reinforceWeight,
+      test6_mistakesInScope,
     ]) {
       const dir = await testFn();
       dirs.push(dir);

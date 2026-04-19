@@ -100,6 +100,7 @@ export interface InboxItem {
   last_prompted_at: string | null;
   status: InboxStatus;
   proposed_decision?: ProposedDecisionDraft;
+  rejection_reason?: string;
 }
 
 // ── Union Type ────────────────────────────────────────────────────────────────

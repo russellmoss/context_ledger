@@ -22,8 +22,7 @@ import type {
   LifecycleState,
   DecisionRecord, InboxItem, EvidenceType, Durability,
 } from "./ledger/index.js";
-import { searchDecisions } from "./retrieval/index.js";
-import type { SearchResult } from "./retrieval/index.js";
+import { queryDecisions } from "./retrieval/index.js";
 import { startMcpServer } from "./mcp-server.js";
 import { detectHookSystem } from "./capture/detect-hooks.js";
 import { runSetupWizard } from "./setup.js";
@@ -133,8 +132,9 @@ async function handleServe(): Promise<void> {
 async function handleQuery(): Promise<void> {
   if (hasFlag("--help")) {
     console.log(`Usage: context-ledger query <text>
-  Searches active decisions using lexical AND matching.
-  Results sorted by effective rank score.`);
+  Returns the full decision pack for the query: prior mistakes in scope,
+  active precedents, abandoned approaches, recently superseded, and pending inbox items.
+  This mirrors what the agent sees over MCP query_decisions.`);
     return;
   }
 
@@ -144,21 +144,94 @@ async function handleQuery(): Promise<void> {
     process.exit(1);
   }
 
-  const results = await searchDecisions(queryText, projectRoot);
+  const pack = await queryDecisions({ query: queryText }, projectRoot);
 
-  if (results.length === 0) {
-    console.log("No matching decisions found.");
-    return;
+  // Section 1 — Prior mistakes in this scope (rendered FIRST per spec).
+  if (pack.mistakes_in_scope.length > 0) {
+    console.log(`\nPrior mistakes in this scope (${pack.mistakes_in_scope.length}):\n`);
+    for (const m of pack.mistakes_in_scope) {
+      switch (m.kind) {
+        case "superseded_with_pain_points":
+          console.log(`  [superseded] ${m.record.id}  → replaced_by ${m.replaced_by}`);
+          console.log(`    ${m.record.summary}`);
+          for (const pp of m.pain_points) console.log(`    pain: ${pp}`);
+          break;
+        case "abandoned":
+          console.log(`  [abandoned]  ${m.record.id}`);
+          console.log(`    ${m.record.summary}`);
+          if (m.reason) console.log(`    reason: ${m.reason}`);
+          for (const pp of m.pain_points) console.log(`    pain: ${pp}`);
+          break;
+        case "rejected_inbox_item":
+          console.log(`  [rejected]   ${m.inbox_id}  ${m.commit_sha.slice(0, 7)}`);
+          console.log(`    ${m.commit_message}`);
+          console.log(`    rejection: ${m.rejection_reason}`);
+          break;
+        default: {
+          const _exhaustive: never = m;
+          throw new Error(`Unhandled MistakeEntry kind: ${JSON.stringify(_exhaustive)}`);
+        }
+      }
+    }
   }
 
-  console.log(`Found ${results.length} decision(s):\n`);
-  for (const r of results) {
-    console.log(`  ${r.record.id}  [${r.state}]  score=${r.effective_rank_score.toFixed(2)}`);
-    console.log(`    ${r.record.summary}`);
-    console.log(`    scope: ${r.record.scope.type}/${r.record.scope.id}`);
-    console.log(`    kind: ${r.record.decision_kind}  durability: ${r.record.durability}`);
-    console.log("");
+  // Section 2 — Active precedents.
+  if (pack.active_precedents.length > 0) {
+    console.log(`\nActive precedents (${pack.active_precedents.length}):\n`);
+    for (const p of pack.active_precedents) {
+      const flags: string[] = [p.match_reason];
+      if (p.review_overdue) flags.push("review_overdue");
+      console.log(`  [active]     ${p.record.id}  weight=${p.retrieval_weight.toFixed(2)}  ${flags.join(" ")}`);
+      console.log(`    ${p.record.summary}`);
+      console.log(`    scope: ${p.record.scope.type}/${p.record.scope.id}  kind: ${p.record.decision_kind}  durability: ${p.record.durability}`);
+    }
   }
+
+  // Section 3 — Abandoned approaches (legacy bucket; may overlap with mistakes).
+  if (pack.abandoned_approaches.length > 0) {
+    console.log(`\nAbandoned approaches (${pack.abandoned_approaches.length}):\n`);
+    for (const a of pack.abandoned_approaches) {
+      console.log(`  [abandoned]  ${a.record.id}  ${a.match_reason}`);
+      console.log(`    ${a.record.summary}`);
+      for (const pp of a.pain_points) console.log(`    pain: ${pp}`);
+    }
+  }
+
+  // Section 4 — Recently superseded (only populated with include_superseded=true).
+  if (pack.recently_superseded.length > 0) {
+    console.log(`\nRecently superseded (${pack.recently_superseded.length}):\n`);
+    for (const s of pack.recently_superseded) {
+      console.log(`  [superseded] ${s.record.id}  → ${s.replaced_by}`);
+      console.log(`    ${s.record.summary}`);
+    }
+  }
+
+  // Section 5 — Pending inbox items.
+  if (pack.pending_inbox_items.length > 0) {
+    console.log(`\nPending inbox items (${pack.pending_inbox_items.length}):\n`);
+    for (const i of pack.pending_inbox_items) {
+      console.log(`  [${i.type}] ${i.inbox_id}  ${i.commit_sha.slice(0, 7)}  ${i.change_category}`);
+      console.log(`    ${i.commit_message}`);
+    }
+  }
+
+  // Footer.
+  const derived = pack.derived_scope
+    ? `${pack.derived_scope.type}/${pack.derived_scope.id} (source: ${pack.derived_scope.source})`
+    : "null (recency fallback)";
+  console.log(`\n— derived_scope: ${derived}`);
+  console.log(`— token_estimate: ${pack.token_estimate}${pack.truncated ? "  (truncated)" : ""}`);
+  if (pack.no_precedent_scopes.length > 0) {
+    console.log(`— no_precedent_scopes: ${pack.no_precedent_scopes.join(", ")}`);
+  }
+
+  const empty =
+    pack.mistakes_in_scope.length === 0 &&
+    pack.active_precedents.length === 0 &&
+    pack.abandoned_approaches.length === 0 &&
+    pack.recently_superseded.length === 0 &&
+    pack.pending_inbox_items.length === 0;
+  if (empty) console.log("\nNo matching decisions found.");
 }
 
 // ── stats ─────────────────────────────────────────────────────────────────────

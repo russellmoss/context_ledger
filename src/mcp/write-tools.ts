@@ -256,11 +256,12 @@ export function registerWriteTools(server: McpServer, projectRoot: string): void
 
         const updatedItems = inboxItems.map((i) => {
           if (i.inbox_id === args.inbox_id) {
-            const updated = { ...i, status: "dismissed" as const, client_operation_id: args.client_operation_id } as PersistedInboxItem;
-            if (args.reason) {
-              (updated as unknown as Record<string, unknown>).rejection_reason = args.reason;
-            }
-            return updated;
+            return {
+              ...i,
+              status: "dismissed" as const,
+              client_operation_id: args.client_operation_id,
+              ...(args.reason ? { rejection_reason: args.reason } : {}),
+            } as PersistedInboxItem;
           }
           return i;
         });

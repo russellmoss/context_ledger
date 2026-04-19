@@ -34,7 +34,7 @@ It's an event-sourced decision ledger with an MCP interface. In plain English:
 
 **Records what failed.** When you abandon an approach, it captures the pain points. Next time an agent proposes the same thing, it gets back "this was tried and abandoned because X, Y, Z."
 
-**Makes decisions retrievable via MCP.** Claude Code, Cursor, Windsurf, or any MCP client can query the ledger by file path, scope, or natural language. The agent gets back a "decision pack" with active precedents, abandoned approaches, and gaps where no precedent exists.
+**Makes decisions retrievable via MCP.** Claude Code, Cursor, Windsurf, or any MCP client can query the ledger by file path, scope, or natural language. The agent gets back a "decision pack" with prior mistakes in scope (surfaced first), active precedents, abandoned approaches, and gaps where no precedent exists.
 
 **Compounds over time.** Each feature you build adds to the precedent history. The more decisions you capture, the fewer "Bucket 2" human input questions come up on the next feature. Your agent learns your project's conventions.
 
@@ -120,7 +120,7 @@ The core loop is: **capture, store, fold, retrieve, compound.**
 
 **Fold.** The "fold" computes current state from the event log. It walks every event in order and produces a materialized view: which decisions are active, which are superseded, which were abandoned, what the effective ranking scores are. Think of it like a git log that computes the current state of the repo.
 
-**Retrieve.** AI agents query via MCP and get back a "decision pack": active precedents that apply to their current scope, abandoned approaches to avoid, recently superseded decisions for context, and pending inbox items to surface. Scope is derived from file paths, config mappings, or natural language hints.
+**Retrieve.** AI agents query via MCP and get back a "decision pack": prior mistakes in the current scope (abandoned approaches, superseded decisions with pain_points, and rejected inbox drafts — surfaced first), active precedents that apply, recently superseded decisions for context, and pending inbox items to surface. Scope is derived from file paths, config mappings, or natural language hints.
 
 **Compound.** Every decision you capture makes the next feature faster. The agent asks fewer questions because it already has precedent. It avoids dead ends because abandoned approaches are flagged. It reinforces good patterns because confirmed decisions get ranking boosts.
 
@@ -132,8 +132,10 @@ The core loop is: **capture, store, fold, retrieve, compound.**
 
 | Tool | Purpose |
 |------|---------|
-| `query_decisions` | Primary retrieval. Derives scope from file paths, config mappings, or query text. Returns a decision pack with active precedents, abandoned approaches, superseded history, and inbox items. Token-budgeted. |
+| `query_decisions` | Primary retrieval. Derives scope from file paths, config mappings, or query text. Returns a decision pack with prior mistakes in scope, active precedents, abandoned approaches, superseded history, and inbox items. Token-budgeted. |
 | `search_decisions` | Lexical search across all active decisions. Returns matching records sorted by effective rank score. Useful for CLI debugging and broad queries. |
+
+**Prior mistakes in scope (v1.2+).** `query_decisions` front-loads antipatterns — abandoned approaches, superseded decisions with pain_points, and rejected inbox drafts — ahead of active precedents in the returned pack. Under token pressure the pack trims from the tail: `active_precedents` first, then `recently_superseded`, then `abandoned_approaches`, then `pending_inbox_items`; `mistakes_in_scope` is the last section dropped. Rationale: preventing a repeat is higher-signal-per-token than restating current convention. `commit_inferred` records are excluded.
 
 ### Write
 
@@ -198,7 +200,7 @@ active --> reinforced    (stays active, ranking boost)
 
 **Superseded** means a newer decision replaced it. This is terminal. The old decision stays in the history with its `replaced_by` pointer so agents can trace the evolution.
 
-**Abandoned** means you tried it and it didn't work. Pain points get captured. Agents see these in the "abandoned approaches" section of decision packs, which prevents them from re-proposing the same thing.
+**Abandoned** means you tried it and it didn't work. Pain points get captured. Agents see these in the "prior mistakes in scope" section of decision packs (surfaced first, and the last section trimmed under token pressure), which prevents them from re-proposing the same thing.
 
 **Reinforced** means an agent encountered an existing precedent during a workflow and reaffirmed it. The decision gets a small ranking boost (capped at +0.15) so it surfaces more prominently in future queries.
 
