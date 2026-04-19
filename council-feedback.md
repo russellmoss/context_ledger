@@ -1,152 +1,88 @@
-# Council Feedback — Setup Wizard (src/setup.ts)
+# Council Feedback — `mistakes_in_scope`
 
-## Sources
-- OpenAI (gpt-5.4, reasoning_effort: high)
-- Gemini (gemini-3.1-pro-preview, thinking: high)
+Two reviewers consulted: **Gemini 3.1 Pro** (via ask_gemini) and **Codex gpt-5.4** (via ask_codex). Gemini focused on spec compliance and DX; Codex focused on type safety, schema integrity, and phase ordering. Findings are merged, deduplicated, and annotated with convergence signal.
+
+Legend: **[BOTH]** both reviewers flagged; **[C]** only Codex; **[G]** only Gemini.
 
 ---
 
 ## CRITICAL
 
-### C1: isCancel() must be checked after every @clack/prompts call (GPT + Gemini)
-Both reviewers flagged this. `confirm()` and `multiselect()` return a symbol on Ctrl+C. Without `isCancel()` checks, the wizard will either crash or silently write garbage to config. The guide mentions importing `isCancel` and has a general cancel pattern, but does not explicitly mandate it at every prompt site.
+- **[BOTH] Trim-order inversion is semantically wrong.** Phase 0 + Phase 4 adopt Option B (trim `recently_superseded` → `abandoned_approaches` → `mistakes_in_scope` → active_precedents from tail, and leave `pending_inbox_items` untouched). The literal feature request says "active_precedents → superseded_history → abandoned_approaches → pending_inbox_items → mistakes_in_scope LAST. Mistakes survive trimming when peers do not." Option B trims abandoned and superseded peers **before** mistakes, so mistakes do survive their direct peers, but `active_precedents` still survives longer than mistakes — the literal phrase "mistakes LAST" is broken. Additionally, Phase 4 leaves `pending_inbox_items` completely untrimmable, which can blow the token budget. **Codex and Gemini both say: go with Option A (spec-literal) — active trimmed first from the tail, pending_inbox_items added to the trim order, mistakes genuinely last.**
 
-**Fix**: Add explicit `isCancel()` check after every `confirm()` and `multiselect()` call. On cancel, call `cancel("Setup cancelled.")` and return.
+- **[BOTH] Phase 1 + Phase 6 change the inbox schema and write path.** The feature description mandates "no new events, no schema changes, no LLM calls." Phase 1 formalizes `InboxItem.rejection_reason?: string` (a schema extension) and Phase 6 rewrites the `reject_pending` write path (`src/mcp/write-tools.ts:261`) to persist it via typed spread. That is **both** a schema change and a write-path change, hidden inside a retrieval-only feature. Two options: (a) drop the Phase 1 schema change and the Phase 6 cleanup entirely — consume the dynamic field via a narrow read-side cast only; (b) accept the schema change as an intentional ratification of the existing out-of-schema field but call it out as a separate decision and spec update, not buried in this feature.
 
-### C2: loadConfig() may return shared DEFAULT_CONFIG singleton — mutation trap (GPT)
-If `loadConfig()` returns `DEFAULT_CONFIG` directly on ENOENT (no deep clone), mutating the returned object mutates the shared default for the process lifetime.
+- **[BOTH] Recency fallback silently drops a mandated source.** The request says "Apply to every scope-derivation path: explicit scope params, file_path-derived, feature_hint_mappings, and recency fallback." Phase 3 explicitly omits rejected inbox items when `derivedScope === null` (recency fallback). That silently violates the feature contract. Must at least surface the N most recent rejected inbox items with their `changed_files` listed as context, even without scope intersection — or explicitly document why recency fallback is an exception and get user sign-off.
 
-**Fix**: Verify that `loadConfig()` returns a fresh deep-merged clone (it uses `deepMerge` which creates new objects). If DEFAULT_CONFIG is returned directly on ENOENT, add a clone. [NEEDS VERIFICATION — check config.ts deepMerge behavior on ENOENT path]
+- **[G] Token budget double-counting.** The Phase 2 classification loop maps superseded/abandoned decisions into `mistakes_in_scope` **while also leaving them in** `abandoned_approaches` and `recently_superseded` (the existing arrays are built by the pre-existing classification block, which wasn't touched). This doubles the token cost for every such record and triggers premature trimming. Either the classification block must skip records promoted to mistakes, or the entry types should share structure so the promotion is a shallow move. Phase 2 section 2.2 does not address this.
 
-### C3: Config directory must be created before writing config.json (GPT + Gemini)
-Step 2 writes to `configPath(projectRoot)` but the `.context-ledger/` directory may not exist on first run. Guide imports `mkdir` but doesn't state to call it before `writeFile`.
-
-**Fix**: Add `await mkdir(ledgerDir(projectRoot), { recursive: true })` before writing config. [NOTE: Guide actually includes this — see "await mkdir(ledgerDir(projectRoot), { recursive: true })" in Step 2. This is already addressed.]
-
-### C4: Windows path normalization for scope_mappings keys (GPT + Gemini)
-`readdir()` on Windows returns backslash paths. Config spec uses forward slashes (`src/path/`). Without normalization, scope matching will fail.
-
-**Fix**: Normalize all paths to forward slashes before using as config keys: `path.split("\\").join("/")`. Ensure trailing slash on directory paths.
-
-### C5: Step 3 hook logic duplication vs extraction (GPT + Gemini)
-Both reviewers flagged that reimplementing hook detection in setup.ts will drift from cli.ts. GPT recommends extracting to shared module. Gemini agrees.
-
-**Assessment**: The guide intentionally reimplements because the UI is different (@clack/prompts vs console.log). However, the DETECTION logic should be shared. The INSTALLATION logic differs in UI output. Recommended: extract hook detection into a shared helper that returns a HookSystem type, keep installation separate with different UI.
-
-### C6: Step 5 uses raw readLedger() instead of materialized state (GPT)
-`readLedger()` returns all events including transitions and non-decision events. Checking `.length > 0` doesn't mean there are active decisions. A ledger with only superseded decisions would show misleading results.
-
-**Fix**: Use `foldLedger()` to get materialized state, then check if any decisions have `state === "active"`. Or simply try `queryDecisions()` and check if `active_precedents.length > 0`.
-
-### C7: queryDecisions() params not specified for Step 5 (GPT)
-Guide says "call queryDecisions" but doesn't specify the exact params object.
-
-**Fix**: Use `queryDecisions({ query: "architecture" }, projectRoot)` — a broad query that returns any active precedents. Already in the guide's Step 5 code example but should be more prominent.
+- **[C] MCP response contract is underspecified.** The plan updates `QueryDecisionsParams` and the MCP Zod **input** params, and updates the tool description string, but never names the explicit file or section where the MCP **response** schema is updated to include `mistakes_in_scope`. Today the MCP server returns `JSON.stringify(pack, null, 2)` with no response schema — fine, but the plan should state that explicitly so no reviewer assumes a Zod response type is missing.
 
 ---
 
 ## SHOULD FIX
 
-### S1: Missing src/ directory edge case (GPT + Gemini)
-If project has no `src/` directory, Step 2 will throw ENOENT. Many projects use `app/`, `lib/`, `server/`, etc.
+- **[C] `inboxItemIntersectsScope` ignores `scope_aliases`.** Phase 3 section 3.2 checks `scope_mappings` and directory fallback only. The spec's scope derivation order is: explicit → scope_mappings → scope_aliases → directory fallback → feature_hint_mappings → recency. Skipping aliases creates false negatives in renamed-directory scenarios (the exact case `scope_aliases` exists to solve).
 
-**Fix**: Check if `src/` exists first. If not, try common alternatives (`app/`, `lib/`, `packages/`). If none found, skip scope generation with a helpful message.
+- **[C] `MistakeEntry` is a discriminated union but consumers don't enforce exhaustiveness.** Phase 5 renders per-kind branches with an `else` fallthrough in CLI. Add `switch(m.kind) { ... default: const _: never = m; throw new Error(...); }` in the CLI renderer and any future consumer so adding a fourth kind breaks the build rather than silently falling through.
 
-### S2: Neither CLAUDE.md nor .cursorrules exists (GPT + Gemini)
-Step 4 doesn't specify what happens if both files are missing. Should it create CLAUDE.md?
+- **[C] "Single construction site" is optimistic.** Phase 1 asserts that `packs.ts:117` is the only `DecisionPack` construction site. This is correct for production code today, but does not account for test fixtures, mock packs, or future snapshot tests that might be added independently. Add a grep check to the Phase 1 validation gate: `grep -rn ": DecisionPack" src/` should show zero matches outside `packs.ts`.
 
-**Fix**: If neither exists, offer to create CLAUDE.md with the standing instructions as initial content. Show `confirm()` first.
+- **[G] Scope intersection too narrow for rejected inbox.** Rejected inbox items often lack standard file scopes (dismissed manual captures, for example, may have sparse `changed_files`). If `changed_files` is empty or points to files outside any mapping, the item is silently dropped. Add a fallback: if `changed_files` is empty, surface via `query` keyword match against `commit_message`.
 
-### S3: Both CLAUDE.md and .cursorrules exist (GPT)
-Guide implies "first match wins" but behavior is ambiguous.
+- **[G] `commit_inferred` exclusion asymmetry.** Excluding `commit_inferred` only from `mistakes_in_scope` but leaving it in `abandoned_approaches` / `recently_superseded` creates a weird invariant: an abandoned commit-inferred decision appears in `abandoned_approaches` but not `mistakes_in_scope`. The spec's "unreviewed inferences never drive autonomous behavior" argues for consistent exclusion — but the user's feature text explicitly limits the exclusion to `mistakes_in_scope`. Document the asymmetry explicitly, or accept it as intentional precedent-preservation (commit_inferred abandoned records are still *context* in `abandoned_approaches`, just not *antipatterns* in `mistakes_in_scope`).
 
-**Fix**: Prefer CLAUDE.md. If both exist, inject into CLAUDE.md only (as the primary). Log a note that .cursorrules was found but CLAUDE.md was used.
+- **[C] MCP annotations must stay `readOnlyHint: true`.** Phase 6 changes the tool description string. The plan does not explicitly call out that annotations must remain unchanged. Make it an explicit subsection of Phase 6.
 
-### S4: Idempotency marker too weak — "context-ledger" string (GPT + Gemini)
-Plain string "context-ledger" can false-positive on prose mentions of the package name.
-
-**Fix**: Use the specific heading `## context-ledger Integration` as the marker for standing instructions. Use `"context-ledger post-commit hook"` as the marker for hooks (already more specific).
-
-### S5: multiselect() with empty options array (GPT)
-If no directories found, calling multiselect with `[]` options is broken UX.
-
-**Fix**: Check if suggestions array is non-empty before calling multiselect. If empty, log info message and skip.
-
-### S6: Sort directory suggestions for deterministic output (GPT)
-readdir() order is not guaranteed across platforms.
-
-**Fix**: Sort suggestions alphabetically before presenting in multiselect.
-
-### S7: feature_hint_mappings generation underspecified (GPT + Gemini)
-Guide mentions generating hints but doesn't specify the exact mapping strategy or merge behavior.
-
-**Fix**: Generate simple keyword mappings from directory basenames. Merge additively — never overwrite existing user-curated hints.
-
-### S8: Agent-guard block detection too vague (GPT)
-"If agent-guard block exists, append after" — what identifies the block?
-
-**Fix**: Search for `## agent-guard` or `# agent-guard` heading. If found, find the next heading of same or higher level, and insert before it. If no next heading, append to end.
-
-### S9: Direct-run detection is brittle (GPT)
-`process.argv[1]?.endsWith("setup.js")` breaks under npm shims and Windows.
-
-**Fix**: Use `import.meta.url` comparison instead:
-```typescript
-import { fileURLToPath } from "node:url";
-const isDirectRun = process.argv[1] === fileURLToPath(import.meta.url);
-```
-
-### S10: No .git directory handling (Gemini)
-If user runs setup before `git init`, hook installation will fail cryptically.
-
-**Fix**: Detect missing `.git/` and show helpful warning: "No git repository found. Run 'git init' and re-run setup to install hooks."
-
-### S11: Existing config entries should not be overwritten (GPT + Gemini)
-Generated scope_mappings should be additive, not replace existing manual entries.
-
-**Fix**: After loadConfig, only add new keys. If a key already exists in scope_mappings, skip it and note "already configured".
+- **[C] `include_feature_local` gating is not plumbed uniformly.** Phase 3 gates the existing feature-local filter in `query.ts:72–78`, but the same flag is not explicitly applied to the new rejected-inbox classification. Rejected inbox items associated with `feature-local` scopes could leak under `include_feature_local: false`. Add a parallel gate in `inboxItemIntersectsScope` or upstream of it.
 
 ---
 
 ## DESIGN QUESTIONS
 
-### D1: What should Step 5 query exactly?
-Consensus: Use `queryDecisions({ query: "architecture" }, projectRoot)` as a broad demonstration query. If pack is empty, show static example.
+- **[BOTH] Why Option B on trim order?** The literal spec text says Option A. The plan documents Option B as "preserves current active-is-last behavior" but offers no argument for why that should override the literal spec. Needs human input.
 
-### D2: Should setup create CLAUDE.md if missing?
-Consensus: Yes, offer to create it. Use `confirm()`.
+- **[BOTH] Is ratifying `rejection_reason` as a typed field acceptable scope for this feature?** It's the right long-term move (eliminates the `as unknown as Record<string, unknown>` cast), but it changes schema and the write path. If accepted, it should appear in the design spec update (Phase 8) as a separate decision.
 
-### D3: Monorepo support — wizard scope
-Both reviewers noted monorepo config fields are unused. This is intentional — v1 is single-repo. The wizard should not populate monorepo fields.
+- **[BOTH] Is the CLI dual-call (`queryDecisions` for mistakes + `searchDecisions` for results) acceptable?** Both reviewers dislike it. Codex: risks mismatched scope/ranking. Gemini: wastes local resources and confuses output. Alternative: replace `searchDecisions` with `queryDecisions` entirely and render the full pack. Needs human input.
 
-### D4: Where to inject if no agent-guard block exists?
-If agent-guard is not present, append to end of file.
+- **[G] Tidy TTL vs mistake durability.** Rejected inbox items older than 30 days are deleted by `context-ledger tidy`. Should items with `rejection_reason` survive tidy (mistakes are long-term guardrails) or should the current 30-day tidy window stand?
+
+- **[G] Agent-guard/context-ledger conflict surface.** If agent-guard says "pattern X" and `mistakes_in_scope` says "pattern X caused pain points", agent paralysis is possible. Should retrieval output annotate which source takes precedence?
+
+- **[C] What's the hot-path audit for Phase 9 agent-guard sync?** The spec demands the post-commit hook stays <100ms with zero LLM/network. The plan's Phase 9 says "run `npx agent-guard sync`" — does that touch the post-commit hook? Make it an explicit no-op check (verify `git diff --stat src/capture/` after sync).
+
+- **[G] Naming — `mistakes_in_scope` vs `prior_mistakes` / `known_antipatterns`?** Existing field names follow `adjective_noun` style (`active_precedents`, `abandoned_approaches`, `recently_superseded`). `mistakes_in_scope` uses a `noun_qualifier` pattern not found elsewhere. User explicitly chose this name in the feature request — override for consistency or honor the explicit choice?
 
 ---
 
 ## SUGGESTED IMPROVEMENTS
 
-### I1: Extract hook detection into shared module
-Move detection logic into `src/capture/detect-hooks.ts` or similar. Return `{ system: "husky"|"lefthook"|"simple-git-hooks"|"bare"|"none", path?: string }`. Both cli.ts and setup.ts call this.
+- **[C] Add a zero-write contract test.** In Phase 7, add one smoke test that records the pre-query mtime of `ledger.jsonl` and `inbox.jsonl`, runs `queryDecisions(...)` with every code path exercised (including rejected inbox classification), and asserts the files are byte-identical afterward. This makes the "no writes on read path" invariant a test instead of a prayer.
 
-### I2: Use `import.meta.url` for direct-run detection
-More reliable than `process.argv[1].endsWith()`.
+- **[C] Add a response-shape snapshot test.** In Phase 7, snapshot the `query_decisions` response shape with `mistakes_in_scope` populated and an empty variant. Any future type change must update the snapshot, catching silent regressions.
 
-### I3: Add `ensureConfigDir()` as first operation
-Call `mkdir(ledgerDir(projectRoot), { recursive: true })` before any config operations.
+- **[G] Granular `include_feature_local`.** Instead of a boolean flag, accept a specific feature slug so the agent only pulls local mistakes for the sub-feature it's working on. Out of scope for v1; note for future iteration.
 
-### I4: Render DecisionPack as formatted summary, not raw JSON
-Format active precedents as bullet list with ID, summary, and weight.
+- **[G] CLI color coding.** When rendering "Prior mistakes in this scope" in the CLI, apply a distinct color (yellow/red) to differentiate antipatterns from neutral results. The project does not currently use `@clack/prompts` for CLI output (only in setup), so this would need a lightweight ANSI escape wrapper. Optional.
+
+- **[C] Phase 3 helper should mirror full scope derivation.** Make `inboxItemIntersectsScope` call (or share implementation with) `deriveScope` rather than reimplementing a narrower version. Reduces drift risk.
 
 ---
 
-## Cross-Check Results
+## Cross-Checks (run by orchestrator, not the reviewers)
 
-1. **Event types**: No new events — wizard is read/write config only. ✅
-2. **MCP tools**: No MCP changes — wizard calls queryDecisions for demo only. ✅
-3. **Lifecycle state machine**: Not affected. ✅
-4. **Auto-promotion threshold**: Not affected. ✅
-5. **Token budgeting**: Not affected (Step 5 demo is display-only). ✅
-6. **Standing instructions snippet**: Must be exact text from spec lines 553-576. ✅ (specified in guide)
-7. **Hook script template**: Must match cli.ts lines 401-405 exactly. ✅ (specified in guide)
-8. **Config structure**: Must match LedgerConfig type and DEFAULT_CONFIG. ✅ (using loadConfig + merge)
+| Check | Result |
+|-------|--------|
+| Every event type in the guide matches schema in context-ledger-design-v2.md | PASS — no new event types. `MistakeEntry` is a retrieval view, not an event. |
+| Every MCP tool matches the spec's parameter list and return format | PARTIAL — `query_decisions` params extended with `include_feature_local` (to be documented in Phase 8). Response shape gains `mistakes_in_scope`. Cross-check confirms no other MCP tool touched. |
+| Lifecycle state machine transitions all legal per spec | PASS — this feature writes zero transitions. |
+| Auto-promotion threshold >= 0.7 enforced correctly | PASS — `commit_inferred` (0.2) exclusion in `mistakes_in_scope` aligns with the spec's "unreviewed inferences never drive autonomous behavior" rule. |
+| Token budgeting implemented on decision packs | PARTIAL — double-counting risk flagged (see CRITICAL). Must resolve before merge. |
+| JSONL append-only respected | PARTIAL — Phase 6's typed-spread replacement still writes dismissed items via `rewriteInbox` (pre-existing atomic-rewrite path), which is already the only non-append write. Not a new violation, but schema-change concern stands. |
+| `.js` import extensions on all new imports | PASS. |
+| MCP annotations unchanged (`readOnlyHint: true, destructiveHint: false, openWorldHint: false`) | PASS — only the description string changes; annotations preserved. |
+| Zero new runtime dependencies | PASS. |
+| Post-commit hook <100ms, zero LLM/network | PASS — no changes to `src/capture/`. |
+
+**Net assessment:** The plan is architecturally sound but has four CRITICAL issues to resolve before execution: (1) trim-order inversion is wrong as coded, (2) the feature accidentally ratifies a schema change it shouldn't, (3) recency fallback drops a mandated source, (4) token double-counting. Three of four require human input. The rest are Bucket 1 autonomous fixes.
