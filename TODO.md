@@ -44,3 +44,11 @@ Scope derivation falls back to filename when given a fully-qualified file path t
 ## Next feature priority (post-v1.2.2 hygiene)
 
 **Transcript miner** — cold-path capture source that reads Claude Code (`~/.claude/projects/<hash>/*.jsonl`) and Codex local transcripts, segments by session, and emits `draft_needed` inbox items with richer proposed drafts than diff-only classification can produce. Autonomy axis #2. Zero hot-path impact, opt-in, redaction mandatory. See `/auto-feature` prompt in prior session history.
+
+## 7. v1.2.2 — Classifier seed rules (extend editor-backup pattern)
+
+Ship additional hard-coded suppression rules in src/capture/classify.ts following the same pattern v1.2.1 established for editor_backup_patterns. Seed rules fire at N=0 for every user — no data accumulation required. Candidate set: (a) trivial .gitignore-only changes (diff touches only .gitignore and is a single-line add/remove of a pattern), (b) IDE-config-only commits (all changed files under .vscode/, .idea/, .fleet/, or similar per-developer directories), (c) lockfile-only changes without corresponding package.json/pyproject.toml/Cargo.toml changes (e.g., npm install refreshing package-lock.json). Each as a small predicate function returning { shouldSuppress, reason }. Configurable toggle per rule via config.capture.classifier, default on. See inbox draft q_1776646621_52 (once confirmed) for full Shape 2 rationale.
+
+## 8. v1.3.0 — Classifier learning layer (thresholded suppression proposals)
+
+The learning half of Shape 2. Background pass during context-ledger tidy (or new CLI context-ledger classifier review) reads dismissed inbox items from the last 60 days, clusters by change_category + rejection_reason similarity (tokenized overlap, not LLM), and emits classifier_proposal inbox items when a cluster crosses threshold (default 5 rejections). Proposals surface as question_needed items; user confirm appends to config.capture.classifier.learned_suppression_rules, user dismiss applies cooldown on the cluster. New inbox_type: "classifier_proposal" (strictly additive). Rollback via context-ledger classifier rules list/remove CLI and matching MCP tools. Hard cap: 1 active proposal per repo at a time. Requires empty-rejection-reason filter to avoid polluting signal with sloppy dismissals. See inbox draft q_1776646621_52 for full rationale.
