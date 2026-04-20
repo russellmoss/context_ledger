@@ -32,3 +32,15 @@ The second option is cleanest but requires threading both tsconfigs through the 
 `npm run test:dogfood` writes to the real project `.context-ledger/ledger.jsonl` instead of an isolated tempdir. Running dogfood during the v1.2.0 audit appended a duplicate decision entry (`d_1776619826_2d69`, "Event fold uses log order not timestamp order") that had to be reverted before commit. All other smoke tests correctly use `mkdtemp`; dogfood is the outlier.
 
 Fix: mirror the `mkdtemp(join(tmpdir(), "cl-dogfood-"))` pattern used in `src/retrieval/smoke-test.ts` and `src/smoke.ts`. Clean up with `rm(dir, { recursive: true, force: true })` in a `finally`. No other changes needed — the test's assertions don't depend on the ledger path.
+
+## 5. v1.2.2 retrieval-tuning — transition-aware scope traversal
+
+When a supersede transition's `replaced_by` lands in scope S, the superseded record should surface in S's `recently_superseded` array even if the superseded record's own scope is narrower or different. Today, a package-scoped query does not surface supersede history for decisions originally scoped to concerns within that package. Discovered via dogfood verification on 2026-04-19 chasing `d_1776622785_4bba` (concern/analyst-bot-planning) → `d_1776623004_155f` (package/packages/analyst-bot).
+
+## 6. v1.2.2 retrieval-tuning — scope derivation fallback for fully-qualified file paths
+
+Scope derivation falls back to filename when given a fully-qualified file path that doesn't match an explicit `scope_mapping`. Observed: file_path `"packages/analyst-bot/src/report-generator.ts"` derived scope `"directory/report-generator.ts"` via `directory_fallback`, not `"directory/packages/analyst-bot"` or `"package/packages/analyst-bot"`. The retrieval still matched via `file_path_hit` against the record's `affected_files`, so this is a cosmetic/diagnostic issue rather than a correctness bug — but the `derived_scope` being reported is misleading. Consider: deriving scope from the deepest matching `scope_mapping` prefix, or from the top-level dir under `src/` / `packages/`. Discovered 2026-04-19.
+
+## Next feature priority (post-v1.2.2 hygiene)
+
+**Transcript miner** — cold-path capture source that reads Claude Code (`~/.claude/projects/<hash>/*.jsonl`) and Codex local transcripts, segments by session, and emits `draft_needed` inbox items with richer proposed drafts than diff-only classification can produce. Autonomy axis #2. Zero hot-path impact, opt-in, redaction mandatory. See `/auto-feature` prompt in prior session history.
