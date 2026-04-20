@@ -1,7 +1,7 @@
 // context-ledger — hook integration tests
 // Standalone script: exit 0 on pass, 1 on fail.
 // Spins up a temp git repo, mocks Anthropic SDK, runs postCommit(), and
-// inspects inbox.jsonl to verify proposed_decision presence/absence.
+// inspects inbox.jsonl to verify proposed_record presence/absence.
 
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
@@ -137,10 +137,10 @@ async function runPostCommitIn(root: string): Promise<void> {
   }
 }
 
-// ── Test 5: drafter returns a draft → inbox item has proposed_decision ──────
+// ── Test 5: drafter returns a draft → inbox item has proposed_record ──────
 
 async function test5WithDraft(): Promise<void> {
-  console.error("\nTest 5: drafter returns draft → inbox item includes proposed_decision");
+  console.error("\nTest 5: drafter returns draft → inbox item includes proposed_record");
   installMock(async () => mockSuccessResponse());
   const prevKey = process.env.ANTHROPIC_API_KEY;
   process.env.ANTHROPIC_API_KEY = "sk-mock";
@@ -157,18 +157,18 @@ async function test5WithDraft(): Promise<void> {
     assert(draftNeeded !== undefined, "a draft_needed item was created");
     if (draftNeeded) {
       assert(
-        draftNeeded.proposed_decision !== undefined,
-        "draft_needed item carries proposed_decision",
+        draftNeeded.proposed_record !== undefined,
+        "draft_needed item carries proposed_record",
       );
-      if (draftNeeded.proposed_decision) {
+      if (draftNeeded.proposed_record) {
         assert(
-          typeof draftNeeded.proposed_decision.summary === "string" &&
-            draftNeeded.proposed_decision.summary.length > 0,
-          "proposed_decision.summary is non-empty",
+          typeof draftNeeded.proposed_record.summary === "string" &&
+            draftNeeded.proposed_record.summary.length > 0,
+          "proposed_record.summary is non-empty",
         );
         assert(
-          draftNeeded.proposed_decision.durability === "feature-local",
-          "proposed_decision.durability matches mock",
+          draftNeeded.proposed_record.durability === "feature-local",
+          "proposed_record.durability matches mock",
         );
       }
     }
@@ -180,10 +180,10 @@ async function test5WithDraft(): Promise<void> {
   }
 }
 
-// ── Test 6: no API key → inbox item written WITHOUT proposed_decision ───────
+// ── Test 6: no API key → inbox item written WITHOUT proposed_record ───────
 
 async function test6WithoutDraft(): Promise<void> {
-  console.error("\nTest 6: no API key → inbox item has no proposed_decision");
+  console.error("\nTest 6: no API key → inbox item has no proposed_record");
   let called = false;
   installMock(async () => {
     called = true;
@@ -204,14 +204,136 @@ async function test6WithoutDraft(): Promise<void> {
     assert(draftNeeded !== undefined, "a draft_needed item was created");
     if (draftNeeded) {
       assert(
-        draftNeeded.proposed_decision === undefined,
-        "draft_needed item omits proposed_decision when no API key",
+        draftNeeded.proposed_record === undefined,
+        "draft_needed item omits proposed_record when no API key",
       );
     }
     assert(!called, "Anthropic SDK was never invoked");
   } finally {
     await rm(root, { recursive: true, force: true });
     if (prevKey !== undefined) process.env.ANTHROPIC_API_KEY = prevKey;
+    restoreMock();
+  }
+}
+
+// ── Test 7: feat + revert within window → revert suppressed ──────────────────
+
+async function test7RevertWithinWindowSuppressed(): Promise<void> {
+  console.error("\nTest 7: feat + revert within window → revert suppressed");
+  installMock(async () => mockSuccessResponse());
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "sk-mock";
+
+  const root = await bootstrapRepo();
+  try {
+    await writeConfig(root, true);
+    await commitNewAuthDir(root);
+    await runPostCommitIn(root);
+    const afterFeat = await readInboxItems(root);
+    const featDraftCount = afterFeat.filter((i) => i.type === "draft_needed").length;
+
+    const git = (args: string[]) =>
+      execFileSync("git", args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+    git(["revert", "--no-edit", "HEAD"]);
+    await runPostCommitIn(root);
+    const afterRevert = await readInboxItems(root);
+    const revertDraftCount = afterRevert.filter((i) => i.type === "draft_needed").length;
+
+    assert(
+      revertDraftCount === featDraftCount,
+      `revert added zero draft_needed items (feat=${featDraftCount}, after-revert=${revertDraftCount})`,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevKey;
+    restoreMock();
+  }
+}
+
+// ── Test 8: feat 48h ago + revert now → revert drafts normally ──────────────
+
+async function test8RevertOutsideWindowDrafts(): Promise<void> {
+  console.error("\nTest 8: feat 48h ago + revert now → revert drafts normally");
+  installMock(async () => mockSuccessResponse());
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "sk-mock";
+
+  const root = await bootstrapRepo();
+  try {
+    await writeConfig(root, true);
+    const oldDate = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+    const gitOld = (args: string[]) =>
+      execFileSync("git", args, {
+        cwd: root,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, GIT_AUTHOR_DATE: oldDate, GIT_COMMITTER_DATE: oldDate },
+      });
+    await mkdir(join(root, "src", "feat48h"), { recursive: true });
+    await writeFile(join(root, "src", "feat48h", "a.ts"), "export const a = 1;\n", "utf8");
+    await writeFile(join(root, "src", "feat48h", "b.ts"), "export const b = 2;\n", "utf8");
+    gitOld(["add", "-A"]);
+    gitOld(["commit", "-q", "-m", "feat: old module skeleton"]);
+    await runPostCommitIn(root);
+    const afterFeat = await readInboxItems(root);
+    const featCount = afterFeat.filter((i) => i.type === "draft_needed").length;
+    assert(featCount >= 1, `feat commit (48h ago) drafted >=1 inbox item (got ${featCount})`);
+
+    execFileSync("git", ["revert", "--no-edit", "HEAD"], {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    await runPostCommitIn(root);
+    const afterRevert = await readInboxItems(root);
+    const revertNew = afterRevert.filter((i) => i.type === "draft_needed").length - featCount;
+    assert(
+      revertNew >= 1,
+      `revert (outside window) drafted >=1 item (added ${revertNew})`,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevKey;
+    restoreMock();
+  }
+}
+
+// ── Test 9: hook-drafted inbox item carries scope fields ────────────────────
+
+async function test9ScopePopulated(): Promise<void> {
+  console.error("\nTest 9: hook-drafted inbox item carries scope fields");
+  installMock(async () => mockSuccessResponse());
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "sk-mock";
+
+  const root = await bootstrapRepo();
+  try {
+    await writeConfig(root, true);
+    await commitNewAuthDir(root);
+    await runPostCommitIn(root);
+
+    const items = await readInboxItems(root);
+    const draftNeeded = items.find((i) => i.type === "draft_needed");
+    assert(draftNeeded !== undefined, "a draft_needed item was created");
+    if (draftNeeded?.proposed_record) {
+      const pr = draftNeeded.proposed_record;
+      assert(
+        typeof pr.scope_type === "string" && pr.scope_type.length > 0,
+        `proposed_record.scope_type is set (got ${pr.scope_type})`,
+      );
+      assert(
+        typeof pr.scope_id === "string" && pr.scope_id.length > 0,
+        `proposed_record.scope_id is set (got ${pr.scope_id})`,
+      );
+      assert(
+        Array.isArray(pr.affected_files) && pr.affected_files.length > 0,
+        `proposed_record.affected_files is populated (got ${pr.affected_files?.length})`,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevKey;
     restoreMock();
   }
 }
@@ -227,6 +349,9 @@ async function main(): Promise<void> {
   }
   await test5WithDraft();
   await test6WithoutDraft();
+  await test7RevertWithinWindowSuppressed();
+  await test8RevertOutsideWindowDrafts();
+  await test9ScopePopulated();
   console.error(`\n${passed} passed, ${failed} failed`);
   process.exit(failed > 0 ? 1 : 0);
 }

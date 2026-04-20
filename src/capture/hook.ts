@@ -8,8 +8,7 @@ import type { FoldedDecision, InboxItem, ProposedDecisionDraft } from "../ledger
 import { generateInboxId, appendToInbox, foldLedger, ledgerPath } from "../ledger/index.js";
 import { loadConfig } from "../config.js";
 import type { LedgerConfig } from "../config.js";
-import { deriveScope } from "../retrieval/index.js";
-import type { DerivedScope } from "../retrieval/index.js";
+import { deriveScope, type DerivedScope } from "../retrieval/index.js";
 import { classifyCommit } from "./classify.js";
 import type { ClassifyResult, ParsedPackageJson } from "./classify.js";
 import { synthesizeDraft } from "./drafter.js";
@@ -40,6 +39,7 @@ function buildInboxItem(
   diffSummary: string,
   config: LedgerConfig,
   proposedDecision?: ProposedDecisionDraft,
+  derivedScope?: DerivedScope | null,
 ): InboxItem {
   const item: InboxItem = {
     inbox_id: generateInboxId(),
@@ -56,7 +56,17 @@ function buildInboxItem(
     last_prompted_at: null,
     status: "pending",
   };
-  if (proposedDecision) item.proposed_decision = proposedDecision;
+  if (proposedDecision) {
+    const enriched: ProposedDecisionDraft = {
+      ...proposedDecision,
+      ...(derivedScope
+        ? { scope_type: derivedScope.type, scope_id: derivedScope.id }
+        : {}),
+      affected_files: [...result.changed_files].sort(),
+      scope_aliases: [],
+    };
+    item.proposed_record = enriched;
+  }
   return item;
 }
 
@@ -130,6 +140,63 @@ function isMergeCommit(projectRoot: string): boolean {
   } catch {
     return false;
   }
+}
+
+// v1.2.1 Bug 9 — same-day revert suppression.
+// Returns true if the current commit is reverted by a within-window commit,
+// OR the current commit is a Revert of a within-window commit. Fails open.
+function isRevertSuppressed(
+  projectRoot: string,
+  sha: string,
+  fullBody: string,
+  windowHours: number,
+): boolean {
+  let raw: string;
+  try {
+    raw = execFileSync(
+      "git",
+      ["log", "-n", "20", "--format=%H%x00%ct%x00%b%x1e"],
+      { cwd: projectRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+  } catch {
+    return false;
+  }
+
+  interface LogEntry {
+    sha: string;
+    ct: number;
+    body: string;
+  }
+  const entries: LogEntry[] = [];
+  for (const rec of raw.split("\x1e").map((r) => r.trim()).filter(Boolean)) {
+    const parts = rec.split("\x00");
+    if (parts.length < 3) continue;
+    const ct = Number(parts[1]);
+    if (!Number.isFinite(ct)) continue;
+    entries.push({ sha: parts[0], ct, body: parts[2] ?? "" });
+  }
+  if (entries.length === 0) return false;
+
+  const current = entries.find((e) => e.sha === sha);
+  if (!current) return false;
+  const windowSeconds = windowHours * 3600;
+
+  // Case A: current commit is reverted by a later within-window commit.
+  for (const other of entries) {
+    if (other.sha === sha) continue;
+    if (!other.body.includes(`This reverts commit ${sha}`)) continue;
+    if (Math.abs(other.ct - current.ct) <= windowSeconds) return true;
+  }
+
+  // Case B: current commit is itself a Revert of an earlier within-window commit.
+  const revertMatch = fullBody.match(/This reverts commit ([0-9a-f]{40})\b/);
+  if (revertMatch) {
+    const targetSha = revertMatch[1];
+    const target = entries.find((e) => e.sha === targetSha);
+    if (target && Math.abs(current.ct - target.ct) <= windowSeconds) return true;
+  }
+
+  return false;
 }
 
 // ── Git Output Parsing ───────────────────────────────────────────────────────
@@ -266,6 +333,13 @@ export async function postCommit(): Promise<void> {
       return;
     }
 
+    // 5b. v1.2.1 Bug 9 — skip if this commit is part of a same-day feat+revert pair.
+    const revertWindowHours = config.capture.drafter.revert_suppression_window_hours ?? 24;
+    if (isRevertSuppressed(projectRoot, sha, fullBody, revertWindowHours)) {
+      debug("same-day revert pair, skipping draft");
+      return;
+    }
+
     // 6. Get changed files via single consolidated git command
     let raw: string;
     try {
@@ -351,6 +425,12 @@ export async function postCommit(): Promise<void> {
     let drafterSkipLoggedForMissingKey = false;
 
     for (const result of results) {
+      const perResultDerived = deriveScope(
+        { file_path: result.changed_files[0] },
+        config,
+        foldedState?.decisions ?? new Map(),
+      );
+
       const rawSummary = buildDiffSummary(result, extras);
       const redactedSummary = redact(rawSummary, config.capture.redact_patterns);
 
@@ -369,14 +449,9 @@ export async function postCommit(): Promise<void> {
             "[context-ledger:drafter] sensitive path detected in changed files — skipping draft",
           );
         } else {
-          const derived = deriveScope(
-            { file_path: result.changed_files[0] },
-            config,
-            foldedState?.decisions ?? new Map(),
-          );
           const precedents = precedentsForScope(
             foldedState?.decisions ?? new Map(),
-            derived,
+            perResultDerived,
           );
           const rawDiff = getCommitDiff(projectRoot, sha, result.changed_files);
           const draft = await synthesizeDraft({
@@ -397,7 +472,7 @@ export async function postCommit(): Promise<void> {
         }
       }
 
-      const item = buildInboxItem(result, sha, redactedMessage, redactedSummary, config, proposed);
+      const item = buildInboxItem(result, sha, redactedMessage, redactedSummary, config, proposed, perResultDerived);
       await appendToInbox(item, projectRoot);
       console.error(
         `[context-ledger] Captured ${result.change_category} (${result.inbox_type})${proposed ? " +draft" : ""}`,

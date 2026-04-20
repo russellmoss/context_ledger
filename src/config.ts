@@ -17,6 +17,11 @@ export interface DrafterCaptureConfig {
   model?: string;
   timeout_ms?: number;
   max_diff_chars?: number;
+  revert_suppression_window_hours?: number;
+}
+
+export interface ClassifierCaptureConfig {
+  editor_backup_patterns: string[];
 }
 
 export interface LedgerConfig {
@@ -30,6 +35,7 @@ export interface LedgerConfig {
     inbox_max_prompts_per_item: number;
     inbox_max_items_per_session: number;
     drafter: DrafterCaptureConfig;
+    classifier?: ClassifierCaptureConfig;
   };
   retrieval: {
     default_limit: number;
@@ -62,7 +68,8 @@ export const DEFAULT_CONFIG: LedgerConfig = {
     inbox_ttl_days: 14,
     inbox_max_prompts_per_item: 3,
     inbox_max_items_per_session: 3,
-    drafter: { enabled: true },
+    drafter: { enabled: true, revert_suppression_window_hours: 24 },
+    classifier: { editor_backup_patterns: ["*.bak", "*.orig", "*.swp", "*.swo", "*~", ".#*", ".DS_Store", "Thumbs.db"] },
   },
   retrieval: {
     default_limit: 20,

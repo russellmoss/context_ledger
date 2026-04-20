@@ -25,6 +25,8 @@ import {
   foldLedger,
 } from "../ledger/index.js";
 import { loadConfig } from "../config.js";
+import type { LedgerConfig } from "../config.js";
+import { deriveScope } from "../retrieval/index.js";
 
 // ── Internal Types (C2/S1 fix) ──────────────────────────────────────────────
 
@@ -51,6 +53,23 @@ type PersistedInboxItem = InboxItem & {
   client_operation_id?: string;
   proposed_record?: ProposedRecord;
 };
+
+// v1.2.1 Bug 7 — derive a real scope for legacy inbox items that lack scope fields.
+// Never returns a literal "unknown" sentinel — falls back to top-level directory or "root".
+function deriveLegacyScope(
+  item: InboxItem,
+  config: LedgerConfig,
+): { type: ScopeType; id: string } {
+  const firstFile = item.changed_files[0];
+  if (firstFile) {
+    const derived = deriveScope({ file_path: firstFile }, config, new Map());
+    if (derived) return { type: derived.type, id: derived.id };
+    const normalized = firstFile.replace(/\\/g, "/");
+    const top = normalized.split("/")[0] ?? "root";
+    return { type: "directory", id: top || "root" };
+  }
+  return { type: "directory", id: "root" };
+}
 
 // ── Response Helpers (I3 fix) ────────────────────────────────────────────────
 
@@ -134,7 +153,9 @@ export function registerWriteTools(server: McpServer, projectRoot: string): void
           alternatives_considered: args.alternatives_considered ?? [],
           revisit_conditions: args.revisit_conditions ?? "",
           review_after: args.review_after ?? null,
-          scope_type: args.scope_type,
+          // TODO(v1.3): tighten scope_type to z.enum(["package","directory","domain","concern","integration"])
+          // with a one-release deprecation warning for non-enum values.
+          scope_type: args.scope_type as ScopeType,
           scope_id: args.scope_id,
           affected_files: args.affected_files ?? [],
           scope_aliases: args.scope_aliases ?? [],
@@ -183,7 +204,10 @@ export function registerWriteTools(server: McpServer, projectRoot: string): void
           return makeToolError("Inbox item already resolved");
         }
 
-        const proposed = item.proposed_record;
+        // v1.2.1 Bug 7 — accept legacy proposed_decision key.
+        const proposed =
+          item.proposed_record ??
+          (item as unknown as { proposed_decision?: ProposedRecord }).proposed_decision;
         if (!proposed) {
           return makeToolError("Inbox item has no proposed record data");
         }
@@ -205,11 +229,13 @@ export function registerWriteTools(server: McpServer, projectRoot: string): void
           decision: proposed.decision,
           alternatives_considered: proposed.alternatives_considered,
           rationale: proposed.rationale,
-          revisit_conditions: proposed.revisit_conditions,
-          review_after: proposed.review_after,
-          scope: { type: proposed.scope_type as ScopeType, id: proposed.scope_id },
-          affected_files: proposed.affected_files,
-          scope_aliases: proposed.scope_aliases,
+          revisit_conditions: proposed.revisit_conditions ?? "",
+          review_after: proposed.review_after ?? null,
+          scope: proposed.scope_type && proposed.scope_id
+            ? { type: proposed.scope_type as ScopeType, id: proposed.scope_id }
+            : deriveLegacyScope(item, await loadConfig(projectRoot)),
+          affected_files: proposed.affected_files ?? [...item.changed_files],
+          scope_aliases: proposed.scope_aliases ?? [],
           decision_kind: proposed.decision_kind,
           tags: proposed.tags,
           durability: proposed.durability,

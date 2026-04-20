@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.2.1 — 2026-04-19
+
+- **capture**: Hook-drafted inbox items now populate `scope_type`, `scope_id`, `affected_files`, and `scope_aliases` at draft time via the existing `deriveScope` helper. Draft items become retrievable via file-path queries and `mistakes_in_scope` — previously they only surfaced via broad recency fallback.
+- **capture**: Inbox draft payload key unified on `proposed_record`. The hook drafter previously wrote under `proposed_decision`; the MCP `propose_decision` tool already wrote under `proposed_record`. Readers fall back to `proposed_decision` for legacy data — no migration required, forward-migrate-on-read only.
+- **capture**: Hook drafter suppresses drafts on same-day revert pairs. Configurable via `capture.drafter.revert_suppression_window_hours` (default 24). Detection keys off the commit body (`This reverts commit <40-char SHA>`), uses committer date (`%ct`), and fails open on git errors. Timing semantics: the suppression fires when the revert lands, so a feat drafted moments earlier stays in the inbox — net effect halves the noise, it does not retroactively erase the feat's draft (which would violate append-only).
+- **classify**: `file-deletion` Tier 1 classifier suppresses commits whose deletions are entirely editor-backup or OS-noise files. Configurable via `capture.classifier.editor_backup_patterns` (default `*.bak`, `*.orig`, `*.swp`, `*.swo`, `*~`, `.#*`, `.DS_Store`, `Thumbs.db`). Mixed commits (backup + real source deletion) still classify the real deletion. Patterns are filename-segment-only.
+- **cli**: `context-ledger query` renders `scope: <type>/<id>` on pending inbox items when the draft payload carries scope fields, making Bug 8's population visible without inspecting JSONL.
+- **schema**: Purely additive. `InboxItem.proposed_record?` added alongside legacy `InboxItem.proposed_decision?`. `ProposedDecisionDraft` extended with optional scope fields (`scope_type`, `scope_id`, `affected_files`, `scope_aliases`, `revisit_conditions`, `review_after`). No changes to `ledger.jsonl` event schema. No changes to MCP tool annotations. No new runtime dependencies.
+- **spec**: `context-ledger-design-v2.md` bumped v2.4 → v2.4.1 with four decision-table entries (Source: `dogfood 2026-04-19`).
+
 ## v1.2.0 — 2026-04-19
 
 - **retrieval (new)**: `query_decisions` response now includes `mistakes_in_scope`, a discriminated union of superseded decisions with non-empty `pain_points`, abandoned decisions, and rejected inbox drafts with `rejection_reason`. Surfaced first in CLI output; last casualty under token-budget trimming.

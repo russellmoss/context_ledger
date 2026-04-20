@@ -83,6 +83,12 @@ export interface ProposedDecisionDraft {
   decision_kind: string;
   tags: string[];
   durability: Durability;
+  scope_type?: ScopeType;
+  scope_id?: string;
+  affected_files?: string[];
+  scope_aliases?: string[];
+  revisit_conditions?: string;
+  review_after?: string | null;
 }
 
 export interface InboxItem {
@@ -99,6 +105,7 @@ export interface InboxItem {
   times_shown: number;
   last_prompted_at: string | null;
   status: InboxStatus;
+  proposed_record?: ProposedDecisionDraft;
   proposed_decision?: ProposedDecisionDraft;
   rejection_reason?: string;
 }

@@ -21,6 +21,7 @@ import {
 import type {
   LifecycleState,
   DecisionRecord, InboxItem, EvidenceType, Durability,
+  ProposedDecisionDraft,
 } from "./ledger/index.js";
 import { queryDecisions } from "./retrieval/index.js";
 import { startMcpServer } from "./mcp-server.js";
@@ -212,6 +213,10 @@ async function handleQuery(): Promise<void> {
     for (const i of pack.pending_inbox_items) {
       console.log(`  [${i.type}] ${i.inbox_id}  ${i.commit_sha.slice(0, 7)}  ${i.change_category}`);
       console.log(`    ${i.commit_message}`);
+      const draft = i.proposed_record ?? (i as unknown as { proposed_decision?: ProposedDecisionDraft }).proposed_decision;
+      if (draft?.scope_type && draft?.scope_id) {
+        console.log(`    scope: ${draft.scope_type}/${draft.scope_id}`);
+      }
     }
   }
 

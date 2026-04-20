@@ -122,6 +122,37 @@ const CONFIG_PATTERN = /tsconfig|eslint|\.prettierrc|jest\.config|vitest\.config
 const ROUTE_PATTERN = /src\/app\/api\/|src\/pages\/api\/|src\/routes\//;
 const SCHEMA_PATTERN = /\b(schema|migration|\.prisma|\.sql|drizzle)\b/i;
 
+// v1.2.1 Bug 10 — default editor-backup + OS-noise patterns. Used when config.capture.classifier is absent.
+const DEFAULT_BACKUP_PATTERNS = [
+  "*.bak", "*.orig", "*.swp", "*.swo", "*~", ".#*",
+  ".DS_Store", "Thumbs.db",
+];
+
+function compileBackupPatterns(patterns: string[]): RegExp[] {
+  const compiled: RegExp[] = [];
+  const seenBad = new Set<string>();
+  for (const pat of patterns) {
+    try {
+      const escaped = pat.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*");
+      compiled.push(new RegExp(`^${escaped}$`));
+    } catch {
+      if (!seenBad.has(pat)) {
+        console.error(`[context-ledger:classify] ignoring invalid editor_backup_pattern: ${pat}`);
+        seenBad.add(pat);
+      }
+    }
+  }
+  return compiled;
+}
+
+function isEditorBackup(filepath: string, compiledPatterns: RegExp[]): boolean {
+  const normalized = filepath.replace(/\\/g, "/");
+  const filename = normalized.split("/").pop() ?? normalized;
+  if (filename.length === 0) return false;
+  for (const rx of compiledPatterns) if (rx.test(filename)) return true;
+  return false;
+}
+
 function detectNewDirectory(added: string[], changed: string[]): { dir: string; files: string[] } | null {
   const addedDirs = new Map<string, string[]>();
   for (const f of added) {
@@ -310,8 +341,17 @@ export function classifyCommit(
     newDir.files.forEach((f) => claimedFiles.add(f));
   }
 
-  // File deletion (non-test, non-doc, not already caught by Tier 2)
-  const unclaimed = del.filter((f) => !claimedFiles.has(f) && !isTestFile(f) && !isDocFile(f));
+  // File deletion (non-test, non-doc, non-editor-backup, not already caught by Tier 2)
+  const backupPatterns = compileBackupPatterns(
+    config.capture.classifier?.editor_backup_patterns ?? DEFAULT_BACKUP_PATTERNS,
+  );
+  const unclaimed = del.filter(
+    (f) =>
+      !claimedFiles.has(f) &&
+      !isTestFile(f) &&
+      !isDocFile(f) &&
+      !isEditorBackup(f, backupPatterns),
+  );
   if (unclaimed.length > 0) {
     results.push({
       tier: 1,
