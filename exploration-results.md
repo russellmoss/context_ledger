@@ -1,198 +1,183 @@
-# v1.2.1 Exploration Results — Four Dogfood Bug Fixes
+# Exploration Results — v1.2.2 Combined Patch
 
-Synthesizes `code-inspector-findings.md` and `pattern-finder-findings.md` for the v1.2.1 patch release. Design spec consulted: `context-ledger-design-v2.md` (v2.4 — to be bumped to v2.4.1 as part of this patch).
+## Pre-Flight Summary
 
----
+Three cold-path, schema-neutral changes. (1) Extend `MatchReason` with `"cross_scope_supersede"` and teach `queryDecisions` to surface superseded records whose `replaced_by` target lives in the query scope. One-hop traversal using `state.decisions` Map — the fold already exposes `replaced_by`. (2) Insert a monorepo-root fallback into `deriveScope` between scope_aliases and directory_fallback; new `ScopeSource` value `"monorepo_root"`; returns ids like `packages/foo`. (3) Add three whole-commit seed-rule predicates to `classifyCommit` (gitignore_trivial, ide_config_only, lockfile_only) gated by `config.capture.classifier.seed_rules.*`, each defaulting to `true`. Rule (a) needs a small, conditional `git diff --numstat` call added to the hook; passed into classify via a new optional parameter mirroring `packageJsonDiff`. Zero event-schema changes, zero new dependencies, zero MCP tool changes, zero CLI user-facing changes. Post-commit hook stays under 100ms because the numstat call only runs when `.gitignore` is the only changed file.
 
-## 1. Pre-Flight Summary
+## Files to Modify
 
-v1.2.1 is four dogfood bug fixes; zero new capabilities, zero new runtime deps, patch-level. All four touch the capture/inbox path; none touch the `ledger.jsonl` event schema. Bug 7 renames the hook drafter's payload key from `proposed_decision` to `proposed_record` with a read-side fallback for legacy items (one writer change + one reader change). Bug 8 populates scope fields in hook-drafted inbox items by calling the existing `deriveScope` helper — its signature is already usable from capture, no refactor needed. Bug 9 adds same-day-revert suppression via a single bounded `git log` shellout in `postCommit`, fail-open under load. Bug 10 filters editor-backup patterns out of the `file-deletion` classifier in `classify.ts`. Config gains `capture.drafter.revert_suppression_window_hours` (default 24) and `capture.classifier.editor_backup_patterns` (default list). Tests extend `src/capture/hook.test.ts` (Tests 7–9) and add `src/capture/classify.test.ts` for Bug 10. Version 1.2.0 → 1.2.1. CHANGELOG + design-spec v2.4 → v2.4.1.
+| File | Issue | Change |
+|---|---|---|
+| `src/retrieval/packs.ts` | 1 | Extend `MatchReason` union on line 10: add `"cross_scope_supersede"` |
+| `src/retrieval/query.ts` | 1 | Insert cross-scope supersede branch in filter loop after line 186, before line 189 |
+| `src/retrieval/scope.ts` | 2 | Extend `ScopeSource` union (lines 9–15) with `"monorepo_root"`; insert monorepo-root check between lines 73 and 76 |
+| `src/config.ts` | 3 | Add `SeedRulesConfig` interface; extend `ClassifierCaptureConfig` with `seed_rules?: SeedRulesConfig`; add defaults in `DEFAULT_CONFIG.capture.classifier` line 72 |
+| `src/capture/classify.ts` | 3 | Add three predicate functions (`isGitignoreTrivialCommit`, `isIdeConfigOnlyCommit`, `isLockfileOnlyCommit`); add early-exit checks after line 222; add new optional `gitignoreDiff` parameter to `classifyCommit` signature |
+| `src/capture/hook.ts` | 3 | Add `parseGitignoreDiff` helper mirroring `parsePackageJsonDiff`; call `git diff --numstat` only when `.gitignore` is the only file in `diff.all`; thread result into `classifyCommit` |
+| `src/retrieval/smoke-test.ts` | 1, 2 | Add test for cross-scope supersede traversal; add test for monorepo-root fallback |
+| `src/capture/classify.test.ts` | 3 | Add three pairs of tests (happy + mixed) — one pair per seed rule |
+| `package.json` | all | Bump `"version"` from `1.2.1` to `1.2.2` |
+| `CHANGELOG.md` | all | Prepend v1.2.2 entry matching v1.2.1 format |
+| `context-ledger-design-v2.md` | all | Bump header from v2.4.1 to v2.4.2; append three decision-table rows between lines 949 and 951 |
 
----
+**No changes needed** to: `src/ledger/events.ts`, `src/ledger/fold.ts`, `src/mcp/*` tool registrations, `src/cli.ts`, `src/retrieval/index.ts` (re-export picks up union extension), `src/setup.ts` (uses `DEFAULT_CONFIG`).
 
-## 2. Files to Modify
+## Type Changes
 
-| File | Change |
-|------|--------|
-| `src/config.ts` | Add `revert_suppression_window_hours?: number` to `DrafterCaptureConfig` (default 24). Add new `ClassifierCaptureConfig` interface with `editor_backup_patterns: string[]`. Add `classifier` key to `LedgerConfig.capture`. Extend `DEFAULT_CONFIG.capture` with `drafter.revert_suppression_window_hours: 24` and `classifier: { editor_backup_patterns: ["*.bak","*.orig","*.swp","*.swo","*~",".#*"] }`. Export `ClassifierCaptureConfig`. |
-| `src/ledger/events.ts` | Extend `ProposedDecisionDraft` (lines 78-86) with optional scope fields: `scope_type?: ScopeType`, `scope_id?: string`, `affected_files?: string[]`, `scope_aliases?: string[]`, `revisit_conditions?: string`, `review_after?: string \| null`. Add `proposed_record?: ProposedDecisionDraft` to `InboxItem` (line 88+) alongside existing `proposed_decision?: ProposedDecisionDraft` (retained as legacy read-only alias). |
-| `src/capture/hook.ts` | (a) `buildInboxItem` (lines 36-61): write `item.proposed_record = proposedDecision` instead of `item.proposed_decision`. Populate scope fields on `proposedDecision` before passing in — compute scope in the drafting loop (line 372 already has `derived`) and thread it into `buildInboxItem`. (b) Add `isRevertSuppressed(projectRoot, sha, fullBody, config)` helper + call after merge-commit check (~line 267) before classification (line 299). If suppressed, log and return. |
-| `src/capture/classify.ts` | Add `DEFAULT_BACKUP_PATTERNS` module constant and `isEditorBackup(p, patterns)` helper (hand-rolled glob: escape `.`, map `*` to `[^/]*`, test against filename segment only). Extend `unclaimed` filter at line 314 to drop editor-backup deletions. Pass `config` (already a param of `classifyCommit`) for pattern list. |
-| `src/mcp/write-tools.ts` | `confirm_pending` line 186: change `const proposed = item.proposed_record;` to `const proposed = item.proposed_record ?? (item as unknown as { proposed_decision?: ProposedRecord }).proposed_decision;`. Default missing scope_type/scope_id/affected_files/scope_aliases/revisit_conditions/review_after at `DecisionRecord` construction lines 196-210 for legacy items that lack them. |
-| `src/capture/hook.test.ts` | Rename 9 assertions from `proposed_decision` to `proposed_record` (lines 160, 161, 163, 165, 166, 167, 170, 171, 207, 208 per code-inspector). Add Test 7 (revert-within-window suppresses both sides), Test 8 (revert-outside-window both draft normally), Test 9 (hook-drafted inbox items carry scope_type/scope_id/affected_files). |
-| `src/capture/classify.test.ts` *(NEW)* | Bug 10 tests: backup-only deletions (foo.bak + bar.orig, no other changes) return no file-deletion classification; mixed deletions (foo.bak + src/real.ts) classify with only src/real.ts in changed_files; .gitignore + backup deletions suppress entirely. Follow the fixture pattern from existing hook.test.ts helpers. |
-| `src/smoke.ts` | Optional end-to-end test (`test7_hookDrafterScopeAndKey`) asserting `proposed_record` key presence + scope population on a hook-drafted item. Follow the `testN_name` numbering. |
-| `CHANGELOG.md` | New v1.2.1 entry at top. Four bullet groups matching existing style (capture/classify/config/spec). Date: 2026-04-20 (or release day). |
-| `context-ledger-design-v2.md` | Bump v2.4 → v2.4.1. Add decision-table entries for the four bug fixes with `Source` column = `"dogfood 2026-04-19"`. Rows 1 and 2 (payload-key unification, scope-field population) are substantive standalone entries; rows 3 and 4 (revert suppression, editor-backup suppression) may be one combined classifier-hygiene entry. |
-| `package.json` | 1.2.0 → 1.2.1 via `npm version patch` at release time (NOT during implementation). |
-
-**Barrel exports:** `src/ledger/index.ts:18` already re-exports `ProposedDecisionDraft` — extended fields propagate automatically. `src/retrieval/index.ts` and `src/capture/index.ts` need no changes (deriveScope signature unchanged; ClassifierCaptureConfig stays in config.ts). `src/retrieval/packs.ts` and `src/cli.ts` do NOT read the draft payload today — no unification reads to add there despite the feature-request wording.
-
----
-
-## 3. Type Changes — exact deltas
-
-### `src/config.ts`
-
+### `MatchReason` — `src/retrieval/packs.ts:10`
 ```ts
-export interface DrafterCaptureConfig {
-  enabled: boolean;
-  model?: string;
-  timeout_ms?: number;
-  max_diff_chars?: number;
-  revert_suppression_window_hours?: number;  // NEW — default 24
+export type MatchReason =
+  | "scope_hit"
+  | "file_path_hit"
+  | "tag_match"
+  | "broad_fallback"
+  | "cross_scope_supersede"; // NEW — v1.2.2
+```
+
+### `ScopeSource` — `src/retrieval/scope.ts:9–15`
+```ts
+export type ScopeSource =
+  | "explicit"
+  | "config_mapping"
+  | "scope_alias"
+  | "directory_fallback"
+  | "monorepo_root"          // NEW — v1.2.2
+  | "feature_hint"
+  | "recency_fallback";
+```
+
+### `ClassifierCaptureConfig` — `src/config.ts:23–25`
+```ts
+export interface SeedRulesConfig {
+  gitignore_trivial?: boolean;  // default: true
+  ide_config_only?: boolean;    // default: true
+  lockfile_only?: boolean;      // default: true
 }
 
-// NEW — export alongside DrafterCaptureConfig
 export interface ClassifierCaptureConfig {
   editor_backup_patterns: string[];
+  seed_rules?: SeedRulesConfig; // NEW — v1.2.2
 }
-
-// LedgerConfig.capture gains:
-//   classifier: ClassifierCaptureConfig;
-
-// DEFAULT_CONFIG.capture gains:
-//   drafter: { enabled: true, revert_suppression_window_hours: 24 },
-//   classifier: { editor_backup_patterns: ["*.bak","*.orig","*.swp","*.swo","*~",".#*"] },
 ```
 
-### `src/ledger/events.ts`
-
+### `DEFAULT_CONFIG.capture.classifier` — `src/config.ts:72`
 ```ts
-// Extend ProposedDecisionDraft (currently lines 78-86) — all OPTIONAL:
-//   scope_type?: ScopeType;
-//   scope_id?: string;
-//   affected_files?: string[];
-//   scope_aliases?: string[];
-//   revisit_conditions?: string;
-//   review_after?: string | null;
-
-// InboxItem: add NEW field alongside existing —
-//   proposed_record?: ProposedDecisionDraft;   // NEW canonical
-//   proposed_decision?: ProposedDecisionDraft; // LEGACY — read-only alias, not written
+classifier: {
+  editor_backup_patterns: ["*.bak", "*.orig", "*.swp", "*.swo", "*~", ".#*", ".DS_Store", "Thumbs.db"],
+  seed_rules: {                  // NEW — v1.2.2
+    gitignore_trivial: true,
+    ide_config_only: true,
+    lockfile_only: true,
+  },
+},
 ```
 
-### `src/mcp/write-tools.ts` — no type changes
-
-Local `ProposedRecord` (lines 31-48) stays structurally a superset of the extended `ProposedDecisionDraft`. `PersistedInboxItem.proposed_record: ProposedRecord` narrows the optional base type — legal in TypeScript. The write path at line 130 already emits `proposed_record`; only the read path at line 186 gains a legacy fallback.
-
----
-
-## 4. Construction Site Inventory
-
-### Writers of the draft payload (all emit `proposed_record` after v1.2.1)
-
-| Site | File:Line | Change |
-|------|-----------|--------|
-| Hook drafter | `src/capture/hook.ts:59` (`buildInboxItem`) | Rename field, populate scope_type/scope_id/affected_files/scope_aliases via `deriveScope` result. |
-| MCP `propose_decision` | `src/mcp/write-tools.ts:130` | Already emits `proposed_record` with full scope fields. No change. |
-
-### Readers of the draft payload (fall back to `proposed_decision` for legacy items)
-
-| Site | File:Line | Change |
-|------|-----------|--------|
-| `confirm_pending` | `src/mcp/write-tools.ts:186` | Add `?? item.proposed_decision` fallback; default missing scope fields. |
-| `src/retrieval/packs.ts` `pending_inbox_items` (~line 205) | Passes whole InboxItem through; does not read draft payload today. | No change. |
-| `src/cli.ts handleQuery` lines 210-216 | Reads envelope fields only; does not render draft payload. | No change. |
-| `src/mcp/read-tools.ts` query_decisions orchestrator | Does not read draft payload. | No change. |
-| `src/mcp/smoke-test.ts:120` | Already casts to `proposed_record`. | No change. |
-| `src/capture/hook.test.ts` | 9 assertions at 160-171, 207-208 on `proposed_decision`. | Rename to `proposed_record`. |
-
-### Revert-check insertion site
-
-`src/capture/hook.ts` between merge-commit check (~line 267) and classification (line 299). `sha` already resolved at line 253; `fullBody` at line 255. New helper shells out `git log -n 20 --format=%H%x00%s%x00%b%x00%ct` with `{ cwd: projectRoot, encoding: "utf8", stdio: "pipe" }`, wrapped in try/catch, fail-open. Returns `true` if:
-1. Any recent commit's subject starts with `Revert ` AND its body contains `This reverts commit <current-sha>` AND that commit's `ct` (commit time) is within window; OR
-2. `fullBody` of current commit starts with `Revert ` AND contains `This reverts commit <sha>` AND that target commit's `ct` is within window (parsed from same git-log output, with sha match).
-
-### File-deletion classifier insertion site
-
-`src/capture/classify.ts:314`:
-
+### `classifyCommit` signature — `src/capture/classify.ts`
+Add new optional parameter at the end (mirrors `packageJsonDiff` pattern):
 ```ts
-// BEFORE
-const unclaimed = del.filter((f) => !claimedFiles.has(f) && !isTestFile(f) && !isDocFile(f));
-
-// AFTER
-const backupPatterns =
-  config.capture.classifier?.editor_backup_patterns ?? DEFAULT_BACKUP_PATTERNS;
-const unclaimed = del.filter(
-  (f) => !claimedFiles.has(f) && !isTestFile(f) && !isDocFile(f) && !isEditorBackup(f, backupPatterns),
-);
+export function classifyCommit(
+  all: string[],
+  deleted: string[],
+  added: string[],
+  subject: string,
+  config: LedgerConfig,
+  packageJsonDiff: ParsedPackageJson | null,
+  gitignoreDiff?: GitignoreDiff | null,  // NEW — v1.2.2
+): ClassifyResult[]
 ```
 
-`DEFAULT_BACKUP_PATTERNS` is a module-level fallback so unit tests can pass a minimal config. `isEditorBackup` matches against `path.split("/").pop()` (filename segment only).
+Where:
+```ts
+export interface GitignoreDiff {
+  added_lines: number;
+  removed_lines: number;
+}
+```
 
-### deriveScope callers audit (all must keep working)
+(No event schema changes — all additive typing.)
 
-| Caller | File:Line | Status after patch |
-|--------|-----------|-------------------|
-| Tier-2 contradiction check | `src/capture/hook.ts:318` | Unchanged. |
-| Drafter precedent lookup | `src/capture/hook.ts:372-374` | Unchanged; Bug 8 reuses this result. |
-| Query orchestrator | `src/retrieval/query.ts:107-111` | Unchanged. |
+## Construction Site Inventory
 
-**Signature change:** none required. Three-parameter signature `(params, config, decisions)` is already callable from capture-side.
+### For Issue 1 (cross-scope supersede)
+- **Match reason assignment**: `src/retrieval/query.ts` filter loop (lines 122–191). Single site. Add new `else if` branch after line 186 (after `tag_match`), before line 189 (`continue`).
+- **`recently_superseded` consumer**: `src/retrieval/packs.ts:109–118` already routes superseded records with any `match_reason` into the bucket — no change needed. The new `"cross_scope_supersede"` reason flows through automatically.
+- **CLI rendering**: `src/cli.ts:183, 195` prints `match_reason` as a string — new value prints automatically. No switch/enum to update.
 
----
+### For Issue 2 (monorepo fallback)
+- **`deriveScope` callers** — behavior improves automatically for all:
+  - `src/retrieval/query.ts:107` — primary query path
+  - `src/capture/hook.ts:393` — Tier 2 contradiction detection
+  - `src/capture/hook.ts:429` — per-result draft scope enrichment
+  - `src/mcp/write-tools.ts:65` — legacy inbox item scope derivation
+- **`source` string consumers**: No exhaustive switch anywhere. `src/retrieval/smoke-test.ts` does string equality on `source` at lines 95, 112, 136, 551 — only against existing values. Adding `"monorepo_root"` is safe.
 
-## 5. Recommended Phase Order
+### For Issue 3 (seed rules)
+- **`classifyCommit` caller**: `src/capture/hook.ts:373` — single caller. Must be updated to pass new `gitignoreDiff` parameter.
+- **Test call sites**: `src/capture/classify.test.ts` (6 existing tests). All call `classifyCommit(...)` with positional args — the new 7th param is optional so existing calls remain type-safe.
+- **Config read site**: only `src/capture/classify.ts` itself reads `config.capture.classifier.seed_rules` — no other consumers.
 
-Nine phases. Each has a bash/grep validation gate and a STOP AND REPORT checkpoint.
+## Recommended Phase Order
 
-**Phase 1 — Blocking Prerequisites.** Working tree clean; `npm run build` green on current master before any edit. Gate: `git status --porcelain` returns no lines; `npm run build` exits 0.
+Dependencies dictate this order. Each phase is self-contained and independently validatable:
 
-**Phase 2 — Type Definitions (intentionally breaks the build).** Edit `src/config.ts` (`DrafterCaptureConfig` field, `ClassifierCaptureConfig`, LedgerConfig.capture, DEFAULT_CONFIG) and `src/ledger/events.ts` (extend `ProposedDecisionDraft`, add `InboxItem.proposed_record`). Gate: `npx tsc --noEmit 2>&1 > /tmp/phase2.log`; count errors; verify the error set is exactly {`src/capture/hook.ts` (field rename), `src/mcp/write-tools.ts` (reader fallback), test files}. Any other file erroring is a red flag.
+1. **Phase 0 — Preconditions**: Verify git clean, baseline `tsc --noEmit` passes, current version is 1.2.1. Read TODO.md items 5, 6, and 7 for authoritative scope. STOP AND REPORT.
 
-**Phase 3 — Classifier (Bug 10).** `src/capture/classify.ts`: add `DEFAULT_BACKUP_PATTERNS`, `isEditorBackup` helper, extend `unclaimed` filter. Gate: `npx tsc --noEmit` shows classify.ts clean.
+2. **Phase 1 — Issue 2 (smallest, zero ripple)**: Extend `ScopeSource` in `scope.ts`; add monorepo-root fallback logic between scope_aliases and directory_fallback; add test to `src/retrieval/smoke-test.ts`. Validate: `npm run build` passes; new test passes; existing tests unchanged. STOP AND REPORT.
 
-**Phase 4 — Hook drafter payload rename + scope population (Bugs 7 + 8).** `src/capture/hook.ts`: update `buildInboxItem` signature to accept a `DerivedScope | null`, rename to `proposed_record`, populate scope fields. Thread `derived` from line 372 into the `buildInboxItem` call at line 400. Gate: `grep -n "proposed_decision" src/capture/hook.ts` returns zero write sites (only type imports / legacy-read comments acceptable).
+3. **Phase 2 — Issue 1 (adds union member, touches query loop)**: Extend `MatchReason` in `packs.ts`; add cross-scope branch in `query.ts` filter loop; add test to `src/retrieval/smoke-test.ts`. Validate: build passes; new test passes; existing retrieval/smoke-test tests still green. STOP AND REPORT.
 
-**Phase 5 — Revert suppression (Bug 9).** Add `isRevertSuppressed` helper and call site after line 267. Use `execSync` with `stdio: "pipe"`, try/catch, fail open. Gate: `grep -n "isRevertSuppressed\|Revert " src/capture/hook.ts` shows the helper; hook.test.ts still type-checks.
+4. **Phase 3 — Issue 3 config surface**: Add `SeedRulesConfig` interface; extend `ClassifierCaptureConfig`; add defaults to `DEFAULT_CONFIG`. No behavior change yet. Validate: build passes; deepMerge handles partial user overrides correctly. STOP AND REPORT.
 
-**Phase 6 — Read-side fallback (Bug 7 legacy).** `src/mcp/write-tools.ts:186`: add `?? item.proposed_decision` fallback; default missing scope_type/scope_id/affected_files/scope_aliases/revisit_conditions/review_after in DecisionRecord construction (lines 196-210). Gate: `npx tsc --noEmit` clean for write-tools.ts; `grep -n "proposed_decision" src/mcp/write-tools.ts` = exactly one fallback read site.
+5. **Phase 4 — Issue 3 predicates**: Add three predicate helpers in `classify.ts`; extend `classifyCommit` with optional `gitignoreDiff` parameter; add early-exit checks after line 222. Existing tests must pass unchanged. Validate: build passes; existing `classify.test.ts` still green. STOP AND REPORT.
 
-**Phase 7 — Tests.** Update `src/capture/hook.test.ts` (9 assertion renames + Tests 7, 8, 9). Add `src/capture/classify.test.ts` (Bug 10 tests). Optional: `src/smoke.ts` end-to-end test. Gate: `npm run build` clean; `node dist/capture/hook.test.js`, `node dist/capture/classify.test.js`, `node dist/capture/drafter.test.js` all exit 0; `node dist/smoke.js` and `node dist/retrieval/smoke-test.js` and `node dist/mcp/smoke-test.js` all pass.
+6. **Phase 5 — Issue 3 hook wiring**: Add `parseGitignoreDiff` helper in `hook.ts`; add conditional `git diff --numstat` call when `.gitignore` is the only changed file; thread result into `classifyCommit` call at line 373. Validate: `hook.test.ts` passes; hook execution budget unchanged. STOP AND REPORT.
 
-**Phase 8 — Documentation Sync.** Run `npx agent-guard sync`. Update `context-ledger-design-v2.md` v2.4 → v2.4.1 with four decision-table entries (Source: "dogfood 2026-04-19"). Add v1.2.1 CHANGELOG entry. Do NOT bump `package.json` version. Gate: `git diff --stat docs/_generated/` shows only expected regenerations; spec version-line updated; CHANGELOG has new top entry.
+7. **Phase 6 — Issue 3 tests**: Add three pairs of tests to `classify.test.ts` — one happy-path (suppression fires) and one mixed-case (suppression does NOT fire) per seed rule. Validate all new tests pass. STOP AND REPORT.
 
-**Phase 9 — Final Validation + Manual Smoke.** `npm run build` (zero errors). All auto tests pass. Manual hook smoke: seed temp repo, make a feat commit that triggers drafter (requires ANTHROPIC_API_KEY or a mock), confirm `proposed_record` key + scope fields present; make an immediate revert, confirm zero new inbox items. Clean temp repo. Gate: all automated tests green + manual smoke confirms Bugs 7/8/9/10 all fixed end-to-end.
+8. **Phase 7 — Docs + version**: Bump `package.json` to 1.2.2; prepend CHANGELOG entry; bump design spec header to v2.4.2; append three decision-table rows. Validate: `npm run build` passes end-to-end; full test suite green. STOP AND REPORT.
 
----
+9. **Phase 8 — agent-guard sync**: Run `npx agent-guard sync`. STOP AND REPORT.
 
-## 6. Risks and Blockers
+## Risks and Blockers
 
-| # | Risk | Mitigation |
-|---|------|-----------|
-| R1 | `ProposedRecord` (write-tools local) has more fields than the extended `ProposedDecisionDraft` (`evidence_type`, `source`, `commit_sha`). Is `PersistedInboxItem.proposed_record: ProposedRecord` a legal narrowing of `InboxItem.proposed_record?: ProposedDecisionDraft`? | Yes — `ProposedRecord`'s fields are a structural superset of the extended `ProposedDecisionDraft`. TypeScript allows narrowing optional types in extending interfaces. Verify via `tsc --noEmit` in Phase 2. |
-| R2 | Hook path must stay <100ms. Adding a `git log` shellout for revert check eats into budget. | Use existing `execSync` pattern (no new spawn overhead). Single call, `-n 20`, minimal format. Wrap in try/catch, fail open on any error. No timeout option set — consistent with other shellouts in the hook. Typical local repo: git log -n 20 runs <10ms. |
-| R3 | `git log --format=%H%x00%s -n 20` may not include the reverted-commit reference (which is in the BODY, not the subject, for `git revert`-generated commits). | Use `--format=%H%x00%s%x00%b%x00%ct` (body + commit-time included). Scan body for `This reverts commit <sha>` regex. Parse `ct` to compare against window. Cost stays small. |
-| R4 | Legacy inbox items with only `proposed_decision` and missing scope_type/scope_id/affected_files/scope_aliases — `confirm_pending` would construct a DecisionRecord with empty strings, which may fail validation. | Default missing `scope_type` to `"directory"`, `scope_id` to marker `"unknown"`, `affected_files` to `item.changed_files`, `scope_aliases` to `[]`, `revisit_conditions` to `""`, `review_after` to `null`. These are the v1.1.0 pre-Bug-8 expected-if-populated values — correct for legacy items. |
-| R5 | `editor_backup_patterns` uses shell-glob syntax. Zero runtime deps means hand-rolled matching. | Match against filename segment only (`path.split("/").pop()`). Compile each pattern to regex: escape `.`, replace `*` with `[^/]*`. Patterns without wildcards match-exact. Implementation: ~20 lines, testable in isolation. |
-| R6 | Spec mentions "commit touches .gitignore AND .gitignore diff adds one of those patterns" — an extra suppression sub-rule. | Simpler correct behavior: filter backups out of `unclaimed`. If all deletions are editor-backups, suppress regardless of .gitignore changes. The .gitignore-adds-pattern condition is additive context, not a gate. Skip the sub-rule unless a test demands it. |
-| R7 | New config `classifier` key under `capture` — users with older config.json rely on deep-merge. | Code-inspector verified `src/config.ts:107-122` deepMerge recurses plain objects, replaces arrays. Adding a new sub-object is safe. Empty user `capture` config still gets full defaults. |
-| R8 | `src/retrieval/packs.ts` listed in feature request as a consumer to unify. | It does not read the draft payload today — passes InboxItem transparently. No code change needed. Call this out in the guide so reviewers don't look for a missing edit. |
-| R9 | `buildInboxItem` in hook.ts currently takes 6 params. Adding `derivedScope` makes 7. | Option A: add `derivedScope: DerivedScope \| null` as param 7. Option B: accept pre-populated `ProposedDecisionDraft` with scope fields already set. Option A is simpler and keeps the drafter's `synthesizeDraft` output untouched (that function doesn't produce scope fields). Prefer Option A. |
-| R10 | `classifyCommit` already takes `config: LedgerConfig`. Bug 10 just reads `config.capture.classifier?.editor_backup_patterns`. No signature change. | Confirmed. |
+### Must-Resolve Before Implementation
 
-No hard blockers. No spec ambiguity that requires human input. All four fixes are orthogonal and implementable in a single session.
+1. **Rule (a) needs git numstat but classifyCommit is pure.** The spec says "Use git diff numstat plus a small diff parse to confirm single-line change." The current classifier is a pure function with zero I/O. Resolution: add a conditional second `execFileSync` call in the hook — only invoked when `.gitignore` is the sole file in `diff.all`. Pass result into `classifyCommit` as a new optional param. This preserves purity and keeps the hook under 100ms (the numstat call runs over a single file only when the filename filter already matches).
 
----
+2. **Monorepo-fallback id format decision.** The feature message offers two options: `{ type: "package", id: "packages/foo" }` or `{ type: "directory", id: "packages/foo" }`. **Recommend**: `{ type: "directory", id: "packages/foo", source: "monorepo_root" }` because (a) it does not claim the directory is a "package" in the event-schema sense (which might not be true for every `packages/*` subdirectory), and (b) it matches the shape of the existing `directory_fallback` branch — only the `source` and `id` format change. Flag this for human confirmation if Gemini/Codex raise it.
 
-## 7. Design Spec Compliance
+3. **`isGitignoreTrivialCommit` happy-path definition.** The spec says "every changed file is .gitignore AND the diff is a single-line add or remove of a pattern." Interpretation: condition is `all.length === 1 && all[0] === ".gitignore" && gitignoreDiff && (gitignoreDiff.added_lines + gitignoreDiff.removed_lines) === 1`. If `gitignoreDiff` is null (hook didn't bother to compute it — e.g. because `all.length > 1`), the rule defaults to NOT suppressing. Document this.
 
-All four fixes are additive at the user-visible API level and preserve every v2.4 invariant:
+### Non-Blocking but Flag
 
-- **JSONL append-only:** No existing lines in `ledger.jsonl` or `inbox.jsonl` rewritten. `rewriteInbox` untouched. All new paths are append-only or read-only.
-- **Post-commit hook <100ms, zero LLM, zero network:** Revert check adds one bounded `git log` shellout; fail-open on slowness. Classifier changes are in-memory only. Drafter scope population reuses an in-scope `deriveScope` call — zero additional I/O.
-- **No `ledger.jsonl` event schema changes:** `DecisionRecord` and `TransitionEvent` untouched. Only `InboxItem` (workflow queue, not event log) and the embedded `ProposedDecisionDraft` shape change — direct precedent with v1.2.0's `rejection_reason` ratification.
-- **MCP tool annotations unchanged:** No new tools, no new tool parameters, no annotation flips. `propose_decision`/`confirm_pending` external signatures stay byte-identical.
-- **Zero new runtime deps:** All four fixes use Node stdlib (`child_process.execSync`) and existing project modules (`deriveScope`, `loadConfig`).
-- **`commit_inferred` exclusion (weight 0.2):** Unchanged. Fixes touch capture/classify, not retrieval weighting.
-- **Feature-local durability default exclusion:** Unchanged.
-- **Auto-promotion threshold (≥0.7 + precedent + active + scope overlap + articulable rationale):** Unchanged.
-- **Lifecycle state machine (superseded terminal, no cycles):** Unchanged.
+4. **`test:classify` script may point to a missing file.** pattern-finder notes `package.json` references `src/capture/smoke-test.js` but no such source file appears in the pattern-finder listing; only `classify.test.ts` and `drafter.test.ts` / `hook.test.ts` are confirmed. Verify during Phase 0 — if the script is stale, either fix it OR route new seed-rule tests into `classify.test.ts` (safer, matches existing 6-test pattern). Do NOT fix unrelated test-runner wiring in this patch.
 
-**Spec deviations:** None. The feature request mentions updating `src/retrieval/packs.ts` as a reader of the draft payload — code-inspector confirms packs.ts does not read the payload today. Guide must call this out so reviewers don't expect a non-existent edit.
+5. **Seed-rule ordering matters.** If a commit changes only `.gitignore` + only a lockfile, both rules (a) and (c) could match. Resolution: evaluate in declared order (gitignore_trivial → ide_config_only → lockfile_only), first match wins, log the first reason. Document in the predicate block.
 
-**Version bump:** Patch (1.2.0 → 1.2.1) correct per SemVer — additive, backward-compatible, preserves response shapes. No user-visible API breakage.
+6. **`.github/` carve-out for rule (b).** Feature spec explicitly excludes `.github/` from IDE-config-only suppression because it can contain meaningful CI workflow changes. Enforce: rule (b) matches `.vscode/`, `.idea/`, `.fleet/`, `.devcontainer/` prefixes only.
 
-**Design-spec update:** v2.4 → v2.4.1 with four decision-table rows sourced "dogfood 2026-04-19". Rows 1–2 (payload-key unification, scope-field population) are substantive; rows 3–4 (revert suppression, editor-backup suppression) can combine into one classifier-hygiene entry. No structural section changes.
+7. **Lockfile-without-manifest detection in rule (c).** The rule fires when `all` contains only lockfiles AND the corresponding manifest is absent. Build a lockfile→manifest map: `package-lock.json`/`yarn.lock`/`pnpm-lock.yaml` → `package.json`; `poetry.lock` → `pyproject.toml`; `Cargo.lock` → `Cargo.toml`; `Gemfile.lock` → `Gemfile`; `go.sum` → `go.mod`. Check every lockfile's manifest is absent from the changeset, not just "any manifest".
+
+8. **include_superseded gate on Issue 1.** The cross-scope branch must only fire when `params.include_superseded === true` (or the config default). Otherwise we'd leak superseded records into the filter that would be stripped later by `buildDecisionPack` anyway — wasted work, no functional bug.
+
+### No Ripple Issues Found
+- Zero runtime dependencies added (all three fixes use existing Node APIs).
+- MCP tool schemas unchanged.
+- Event schema unchanged.
+- JSONL append-only invariant preserved (none of the three touch ledger writes).
+- Auto-promotion threshold logic unchanged.
+- `MatchReason` and `ScopeSource` have no exhaustive switches — extending unions is safe.
+
+## Design Spec Compliance
+
+All three issues comply with `context-ledger-design-v2.md`:
+
+- **Event schema** (Issue 1): No new event types, no new fields on `DecisionRecord` or `TransitionEvent`. Cross-scope traversal is derived at query time from existing `replaced_by` and `scope` fields. Matches the spec principle that the ledger is append-only and fold state is derived.
+- **Retrieval contract** (Issue 1): `MatchReason` is an open, retrieval-layer concept. The spec's "Decision Pack Response" shape at line ~2400 lists `match_reason` as a string. Adding a new value fits. `recently_superseded` is already a documented bucket.
+- **Scope derivation fallback order** (Issue 2): The spec's Scope Derivation Fallback Order (CLAUDE.md quick-ref) is preserved — explicit → scope_mappings → scope_aliases → directory_fallback → feature_hint → recency. Monorepo-root is a refinement of the directory_fallback step, not a reordering. Existing semantics preserved for unrecognized paths.
+- **Classifier determinism** (Issue 3): Matches the "Tier 1 / Tier 2 / Ignored" framework. The three new rules are deterministic, config-gated early exits consistent with the existing `ignore_paths`, test-file, and `editor_backup_patterns` filters. No LLM calls, no network.
+- **Config shape**: `capture.classifier.seed_rules` nesting is consistent with other nested sub-keys in the config (e.g. `capture.drafter.*`). Additive only; `deepMerge` handles partial user overrides.
+- **Version bump**: Patch (1.2.1 → 1.2.2) is correct — all changes are behavior improvements, not breaking.
+- **Autonomy axis**: Improves axis #1 (capture quality — Issue 3) and retrieval quality (Issues 1 and 2). Does not unlock new autonomy, does not move the auto-promotion threshold. Matches the v1.2.2 north-star.
+
+**No deviations flagged.** All three fixes stay inside the envelope the spec authorizes.

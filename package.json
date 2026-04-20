@@ -33,7 +33,7 @@
     "test:mcp": "node dist/mcp/smoke-test.js",
     "test:drafter": "node dist/capture/drafter.test.js",
     "test:hook": "node dist/capture/hook.test.js",
-    "test:classify": "node dist/capture/smoke-test.js",
+    "test:classify": "node dist/capture/smoke-test.js && node dist/capture/classify.test.js",
     "test": "npm run test:integration && npm run test:retrieval && npm run test:mcp && npm run test:classify && npm run test:drafter && npm run test:hook",
     "smoke:drafter": "tsx src/smoke-drafter.ts",
     "prepare": "npx husky",

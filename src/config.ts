@@ -20,8 +20,15 @@ export interface DrafterCaptureConfig {
   revert_suppression_window_hours?: number;
 }
 
+export interface SeedRulesConfig {
+  gitignore_trivial?: boolean;  // default: true — suppress single-line .gitignore-only commits
+  ide_config_only?: boolean;    // default: true — suppress commits touching only per-developer IDE config dirs
+  lockfile_only?: boolean;      // default: true — suppress commits changing only lockfiles without their manifests
+}
+
 export interface ClassifierCaptureConfig {
   editor_backup_patterns: string[];
+  seed_rules?: SeedRulesConfig;
 }
 
 export interface LedgerConfig {
@@ -69,7 +76,14 @@ export const DEFAULT_CONFIG: LedgerConfig = {
     inbox_max_prompts_per_item: 3,
     inbox_max_items_per_session: 3,
     drafter: { enabled: true, revert_suppression_window_hours: 24 },
-    classifier: { editor_backup_patterns: ["*.bak", "*.orig", "*.swp", "*.swo", "*~", ".#*", ".DS_Store", "Thumbs.db"] },
+    classifier: {
+      editor_backup_patterns: ["*.bak", "*.orig", "*.swp", "*.swo", "*~", ".#*", ".DS_Store", "Thumbs.db"],
+      seed_rules: {
+        gitignore_trivial: true,
+        ide_config_only: true,
+        lockfile_only: true,
+      },
+    },
   },
   retrieval: {
     default_limit: 20,

@@ -7,7 +7,12 @@ import type { LedgerConfig } from "../config.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-export type MatchReason = "scope_hit" | "file_path_hit" | "tag_match" | "broad_fallback";
+export type MatchReason =
+  | "scope_hit"
+  | "file_path_hit"
+  | "tag_match"
+  | "broad_fallback"
+  | "cross_scope_supersede";
 
 export interface PackEntry {
   record: DecisionRecord;
@@ -74,7 +79,11 @@ export function buildDecisionPack(
   rejectedInboxItems: InboxItem[],
   params: { include_superseded?: boolean; include_unreviewed?: boolean; include_feature_local?: boolean; limit?: number; offset?: number },
   config: LedgerConfig,
+  effectiveIncludeSuperseded?: boolean,       // v1.2.2 C3 — defaults to params.include_superseded for back-compat.
+  effectiveIncludeCrossScope?: boolean,       // v1.2.2 Q2 — defaults true (surface cross-scope supersedes by default).
 ): DecisionPack {
+  const includeSuperseded = effectiveIncludeSuperseded ?? params.include_superseded ?? false;
+  const includeCrossScope = effectiveIncludeCrossScope ?? true;
   const now = Date.now();
   const ninetyDaysMs = 90 * 24 * 60 * 60 * 1000;
   const limit = params.limit ?? config.retrieval.default_limit;
@@ -106,7 +115,13 @@ export function buildDecisionPack(
         match_reason: folded.match_reason,
         pain_points: lastAbandon?.pain_points ?? [],
       });
-    } else if (folded.state === "superseded" && params.include_superseded) {
+    } else if (folded.state === "superseded") {
+      // v1.2.2 Q2: cross-scope supersedes surface even when include_superseded
+      // is false — they are genealogy of the in-scope record, not stale history.
+      // Same-scope superseded records continue to require include_superseded.
+      const isCrossScope = folded.match_reason === "cross_scope_supersede";
+      const gate = isCrossScope ? includeCrossScope : includeSuperseded;
+      if (!gate) continue;
       const lastSupersede = findLastTransition(folded, "supersede");
       if (lastSupersede && now - new Date(lastSupersede.created).getTime() <= ninetyDaysMs) {
         recentlySuperseded.push({

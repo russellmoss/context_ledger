@@ -20,6 +20,7 @@ export interface QueryDecisionsParams {
   decision_kind?: string;
   tags?: string[];
   include_superseded?: boolean;
+  include_cross_scope_supersede?: boolean;
   include_unreviewed?: boolean;
   include_feature_local?: boolean;
   limit?: number;
@@ -81,6 +82,18 @@ function inboxItemIntersectsScope(
       }
     }
 
+    // 2.5 Monorepo-root fallback (v1.2.2) — mirror scope.ts monorepo_root branch.
+    // If the file lives under packages/<pkg>/..., derive "packages/<pkg>" and
+    // compare against the queried scope.
+    const monorepoRoots = ["packages", "apps", "services"];
+    const msegments = n.split("/").filter((s) => s !== "" && s !== "." && s !== "..");
+    if (msegments.length >= 2 && monorepoRoots.includes(msegments[0])) {
+      const pkg = msegments[1];
+      if (pkg && !pkg.startsWith(".") && `${msegments[0]}/${pkg}` === scope.id) {
+        return true;
+      }
+    }
+
     // 3. Directory fallback (mirror scope.ts:76–89)
     const segments = n.split("/");
     const srcIdx = segments.indexOf("src");
@@ -109,6 +122,13 @@ export async function queryDecisions(
     config,
     state.decisions,
   );
+
+  // v1.2.2 council C3: resolve include_superseded once with config fallback,
+  // reuse in filter loop + pack builder to avoid split-brain.
+  const includeSuperseded = params.include_superseded ?? config.retrieval.include_superseded;
+  // v1.2.2 Q2 human-gate: cross-scope supersedes default surface-on. Opt out
+  // per query via include_cross_scope_supersede: false. No config-level field.
+  const includeCrossScopeSupersede = params.include_cross_scope_supersede ?? true;
 
   // 3. Collect all hint scope IDs for broader filtering
   const hintScopeIds = params.query
@@ -184,6 +204,38 @@ export async function queryDecisions(
         );
         if (hasTagOverlap) matchReason = "tag_match";
       }
+
+      // Cross-scope supersede traversal (v1.2.2) — one hop only.
+      // derivedScope is guaranteed non-null here (we are inside the outer
+      // `else { derivedScope !== null }` branch — do NOT hoist this check
+      // out). A superseded record surfaces in scope S's pack when its
+      // replaced_by points to a decision whose scope matches S, even if the
+      // superseded record's own scope was narrower or different.
+      //
+      // Surfaces at default params: cross-scope supersedes are the genealogy
+      // of the record IN scope, not stale history. Opt-out per query via
+      // include_cross_scope_supersede: false. Unlike same-scope superseded
+      // records, this branch does NOT honor include_superseded — those are
+      // different semantics (see Phase 2 note in the guide).
+      //
+      // Replacement may be missing if the ledger was trimmed/corrupted —
+      // `state.decisions.get` returns undefined; the guard below treats it
+      // as "no match" and the record is skipped.
+      if (
+        !matchReason &&
+        folded.state === "superseded" &&
+        folded.replaced_by &&
+        includeCrossScopeSupersede
+      ) {
+        const replacement = state.decisions.get(folded.replaced_by);
+        if (
+          replacement &&
+          replacement.record.scope.type === derivedScope.type &&
+          replacement.record.scope.id === derivedScope.id
+        ) {
+          matchReason = "cross_scope_supersede";
+        }
+      }
     }
 
     if (!matchReason) continue;
@@ -241,7 +293,7 @@ export async function queryDecisions(
         .slice(0, RECENCY_FALLBACK_REJECTED_INBOX_CAP);
 
   // 7. Build and return decision pack
-  return buildDecisionPack(filtered, derivedScope, pendingInbox, rejectedInboxItems, params, config);
+  return buildDecisionPack(filtered, derivedScope, pendingInbox, rejectedInboxItems, params, config, includeSuperseded, includeCrossScopeSupersede);
 }
 
 // ── Search Decisions ─────────────────────────────────────────────────────────

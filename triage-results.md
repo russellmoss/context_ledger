@@ -1,68 +1,58 @@
-# Triage Results — v1.2.1
+# Triage Results — v1.2.2 Council Feedback
 
-Reviewers: Codex (local CLI, gpt-5.4) + Gemini (gemini-3.1-pro-preview). OpenAI API unavailable (quota 429) — Codex is the permanent substitute in this repo.
+Categorization of every council item. Bucket 1 items have been folded into `agentic_implementation_guide.md` (see the Refinement Log at the bottom of that file). Bucket 2 items are surfaced at the Human Input Gate.
 
-## Bucket 1 — applied autonomously to `agentic_implementation_guide.md`
+Reviewers: **Codex** (local CLI, gpt-5.4) + **Gemini** (gemini-3.1-pro-preview). OpenAI API unavailable per repo policy (quota 429) — Codex is the permanent substitute.
 
-See the Refinement Log appended to the guide for the full list. Summary: 10 changes landed, covering all three CRITICAL council items (Windows execSync, scope sentinel pollution, abbreviated-SHA collision), plus code-quality fixes (precompiled regex, malformed-pattern safety, OS-noise patterns, Windows-path normalization, CLI visibility phase, extended test coverage).
+## Bucket 1 — Applied Autonomously
 
-## Bucket 2 — awaiting user input
+| ID | Summary | Applied In |
+|---|---|---|
+| C1 | `.gitignore` hook/classifier mismatch → use "any-tree, sole file" semantics in both layers; pass actual path to numstat | Phase 5 Edits 2 & 3 |
+| C2 | `inboxItemIntersectsScope` path-derivation copy drifts from `deriveScope` — mirror the monorepo check there too | Phase 1, new section after scope.ts edits |
+| C3 | `include_superseded` split-brain between query filter and pack builder — compute once, pass through | Phase 2 Edit + buildDecisionPack signature change |
+| C4 | `lockfile_only` path-insensitive — compare (parentDir, basename) tuples | Phase 4 Edit 3 rewrite |
+| C5 | `HEAD~1` stderr noise on initial commits — pre-check with `git rev-parse --verify` | Phase 5 Edit 2 |
+| C6 | `test:classify` dead-code `classify.test.ts` — chain both files in the npm script | Phase 6 package.json edit |
+| S2 | Dangling-pointer comment on cross-scope branch | Phase 2 NEW block comments |
+| S3 | Narrative fallback-order prose update | Phase 7 Edit 3 |
+| S4 | Windows-path regression in ide_config_only test | Phase 6 test_9 update |
+| S5 | Numstat `-` binary-file documentation | Phase 5 Edit 2 comment |
+| S6 | Test 12 comment explaining dep-addition category + changed_files semantics | Phase 6 test_12 update |
+| S7 | Cross-scope branch-placement comment ("do NOT hoist") | Phase 2 NEW block comments |
+| I3 | `deepMerge` boolean-override regression test | Phase 6 test_14 |
 
-Four open questions. Each has a default the guide will ship with if you say "proceed" without answering specifics.
+### Design defaults applied (council recommendations)
 
-### Q1 — Bug 9 semantic: "halves" or "eliminates" the inbox noise?
+| ID | Question | Choice |
+|---|---|---|
+| D2 | Multi-hop supersede chain | **One hop** (per feature spec) |
+| D3 | Scope id format | `{ id: "packages/foo" }` (namespaced) |
+| D4 | Consult `config.monorepo.*` | **No** — hardcode `packages/`, `apps/`, `services/` |
+| D5 | Replacement state check in cross-scope branch | **No** — existence + scope match only |
 
-The current guide ships with "halves the noise": when a feat commit runs the hook, the revert doesn't exist yet, so the feat drafts an inbox item. When the revert commit runs the hook, only the revert's draft is suppressed. Net result: 1 draft, not 2 (was previously 2).
+## Bucket 2 — Human Input Needed
 
-**Both reviewers flagged this** as a gap against the literal acceptance-test wording ("feat + revert → zero inbox items"). Two paths:
+Three questions surface at the end of the guide. Autonomous defaults applied but flagged for confirmation.
 
-- **(A) Ship the halving.** CHANGELOG documents explicitly that the suppression fires on the revert only; users manually reject the feat's draft if they see both. Zero additional code. Ships in v1.2.1.
-- **(B) Deferred-write design.** Hook writes drafts to a staging file `.context-ledger/inbox.pending` with a grace period (e.g. 5 minutes). A timer or the next hook invocation promotes or annihilates. Does NOT violate append-only for `inbox.jsonl` (staging is ephemeral). Significantly more code; scope-creeps beyond "bug fix". Would probably warrant its own feature cycle and version bump (v1.3.0 not v1.2.1).
+| ID | Question | Autonomous default |
+|---|---|---|
+| S1 | `MatchReason` name: `cross_scope_supersede` vs `replacement_scope_hit` | `cross_scope_supersede` |
+| D1 | Cross-scope default-surface: gate on `include_superseded` or always surface | Keep gate |
+| D6 | `gitignore_trivial` scope: root-only or any-tree | Any-tree (ties C1 to same semantics) |
 
-**Default if you don't answer: (A).** Ship the halving; land deferred-write as a future feature if dogfood shows the residual noise is worth the complexity.
+## Bucket 3 — Noted, Not Applied
 
-### Q2 — Legacy-item evidence weighting
+| ID | Summary | Reason |
+|---|---|---|
+| I1 | Generic `fileStats` param (forward-compat for more seed rules) | Out of scope for v1.2.2; revisit at v1.3.0 learning layer |
+| I4 | MCP tool description hint about following `replaced_by` | MCP tool annotations unchanged this release per invariants |
 
-When a pre-v1.2.1 `proposed_decision` inbox item is confirmed post-patch, `confirm_pending` stamps `evidence_type: "confirmed_draft"` (retrieval_weight 0.8), same as a fresh draft. Codex flagged this as overstating confidence — the drafted payload predates scope enrichment and may carry less information.
+## Cross-Checks
 
-Options:
-
-- **(A) Ship unchanged.** Legacy drafts get 0.8 weight. Precedent: v1.2.0 did the same thing for pre-existing drafts.
-- **(B) Introduce a new evidence type** `legacy_confirmed_draft` at weight 0.7 (still auto-promotion eligible but below `confirmed_draft`). Requires: extend `EvidenceType` enum in events.ts, add weight entry, update auto-promotion spec row. Scope creep.
-- **(C) Force-flag** legacy items in UI (prefix with `[legacy]` in CLI output, `legacy: true` in MCP response). Cosmetic; no weight change.
-
-**Default if you don't answer: (A).** Ship unchanged. Legacy items are rare (drafter only exists since v1.1.0, ~3 days ago) — the cost/benefit of a new evidence type isn't clear yet.
-
-### Q3 — Bug 10 scope: file-deletion only or all Tier 2 detectors too?
-
-The current guide narrowly suppresses only the Tier 1 `file-deletion` classifier. Codex raised: a cleanup commit containing only `.bak`/`.orig` deletions could still trip Tier 2 detectors (module replacement, feature removal, auth-security-change) that read the same `del` list.
-
-Options:
-
-- **(A) Narrow.** Suppress only Tier 1 `file-deletion`. Current guide ships this. Low risk of over-suppression. Documented in Phase 3 STOP AND REPORT.
-- **(B) Broad.** Apply editor-backup filter globally anywhere the classifier reads `del` — propagate `backupPatterns` through `classifyCommit` and filter at every consumer.
-
-**Default if you don't answer: (A).** Narrow. Tier 2 detectors are rare to trip and have their own semantic gates; a dogfood report showing Tier 2 noise from backup cleanup would justify broadening in a follow-up.
-
-### Q4 — CLI scope rendering (Phase 6.5): ship in v1.2.1?
-
-Added a new Phase 6.5 that renders `scope: <type>/<id>` on pending inbox items in `context-ledger query` output. Reviewers flagged that Bug 8's fix is invisible without this. It's ~4 lines of code in `src/cli.ts handleQuery`, guarded by a simple null-check.
-
-Options:
-
-- **(A) Include in v1.2.1.** Ship with Phase 6.5. Bug 8 visible without cat-ing JSONL. (Current default.)
-- **(B) Defer.** Remove Phase 6.5; ship without CLI visibility; rely on MCP query path + users' direct JSONL inspection.
-
-**Default if you don't answer: (A).** Include. The change is tiny, the visibility gain is meaningful, and it's strictly additive to the CLI output format (no breaking change to existing output).
-
-## Bucket 3 — noted, not applied
-
-- Error message wording (cosmetic).
-- Deferred-write staging (scope expansion; promoted to Q1 as (B) option).
-- Evidence-type downgrade (scope expansion; promoted to Q2 as (B) option).
-
-## Human Input Gate — ready message
-
-If you're comfortable with defaults (A) on all four questions, say "proceed with defaults". Otherwise, answer per-question (e.g. "Q1: A, Q2: C, Q3: A, Q4: A") and I'll apply any deltas.
-
-Once the guide is final, run `/compact` to clear context, then: **Execute `agentic_implementation_guide.md` phase by phase.**
+- All events conform to existing schema (no new types, no new fields).
+- All MCP tool contracts unchanged.
+- JSONL append-only invariant preserved.
+- Auto-promotion threshold (≥ 0.7, precedent, active) unchanged.
+- Token budgeting unchanged.
+- Post-commit hook budget preserved — extra git call is conditional (sole `.gitignore` only).

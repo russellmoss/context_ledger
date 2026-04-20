@@ -654,6 +654,197 @@ async function testH_recencyFallbackCap(tmpDir: string): Promise<void> {
   }
 }
 
+// ── v1.2.2 Cross-Scope Supersede Tests ───────────────────────────────────────
+
+async function testJ_crossScopeSupersedeDefault(tmpDir: string): Promise<void> {
+  console.error("\nTest J: cross-scope supersede surfaces at default params (Q2 → B)");
+
+  const dA = makeDecision({
+    id: generateDecisionId(),
+    evidence_type: "explicit_manual",
+    durability: "precedent",
+    scope: { type: "concern", id: "test-planning" },
+    summary: "narrow concern-scoped decision",
+  });
+  const dB = makeDecision({
+    id: generateDecisionId(),
+    evidence_type: "explicit_manual",
+    durability: "precedent",
+    scope: { type: "directory", id: "packages/foo" },
+    summary: "broader package-scoped replacement",
+  });
+  await appendToLedger(dA, tmpDir);
+  await appendToLedger(dB, tmpDir);
+  await appendToLedger(
+    makeTransition({
+      target_id: dA.id,
+      action: "supersede",
+      replaced_by: dB.id,
+      reason: "broadened scope",
+    }),
+    tmpDir,
+  );
+
+  const pack = await queryDecisions({ scope_type: "directory", scope_id: "packages/foo" }, tmpDir);
+  assert(pack.recently_superseded.length === 1, `recently_superseded.length === 1 (got ${pack.recently_superseded.length})`);
+  assert(pack.recently_superseded[0]?.record.id === dA.id, "recently_superseded[0].record.id === dA.id");
+  assert(
+    pack.recently_superseded[0]?.match_reason === "cross_scope_supersede",
+    `match_reason === cross_scope_supersede (got ${pack.recently_superseded[0]?.match_reason})`,
+  );
+}
+
+async function testK_crossScopeSupersedeOptOut(tmpDir: string): Promise<void> {
+  console.error("\nTest K: cross-scope supersede opt-out via include_cross_scope_supersede: false");
+
+  const dA = makeDecision({
+    id: generateDecisionId(),
+    evidence_type: "explicit_manual",
+    durability: "precedent",
+    scope: { type: "concern", id: "test-planning" },
+    summary: "narrow concern-scoped decision",
+  });
+  const dB = makeDecision({
+    id: generateDecisionId(),
+    evidence_type: "explicit_manual",
+    durability: "precedent",
+    scope: { type: "directory", id: "packages/foo" },
+    summary: "broader package-scoped replacement",
+  });
+  await appendToLedger(dA, tmpDir);
+  await appendToLedger(dB, tmpDir);
+  await appendToLedger(
+    makeTransition({
+      target_id: dA.id,
+      action: "supersede",
+      replaced_by: dB.id,
+      reason: "broadened scope",
+    }),
+    tmpDir,
+  );
+
+  const pack = await queryDecisions(
+    { scope_type: "directory", scope_id: "packages/foo", include_cross_scope_supersede: false },
+    tmpDir,
+  );
+  assert(pack.recently_superseded.length === 0, `recently_superseded.length === 0 (got ${pack.recently_superseded.length})`);
+}
+
+async function testL_sameScopeStillRequiresIncludeSuperseded(tmpDir: string): Promise<void> {
+  console.error("\nTest L: same-scope supersede still requires include_superseded (regression guard)");
+
+  const dC = makeDecision({
+    id: generateDecisionId(),
+    evidence_type: "explicit_manual",
+    durability: "precedent",
+    scope: { type: "directory", id: "packages/foo" },
+    summary: "old same-scope",
+  });
+  const dD = makeDecision({
+    id: generateDecisionId(),
+    evidence_type: "explicit_manual",
+    durability: "precedent",
+    scope: { type: "directory", id: "packages/foo" },
+    summary: "new same-scope replacement",
+  });
+  await appendToLedger(dC, tmpDir);
+  await appendToLedger(dD, tmpDir);
+  await appendToLedger(
+    makeTransition({
+      target_id: dC.id,
+      action: "supersede",
+      replaced_by: dD.id,
+      reason: "refined",
+    }),
+    tmpDir,
+  );
+
+  // Default params: include_superseded absent → same-scope superseded hidden.
+  const pack1 = await queryDecisions({ scope_type: "directory", scope_id: "packages/foo" }, tmpDir);
+  assert(pack1.recently_superseded.length === 0, `default: same-scope hidden (got ${pack1.recently_superseded.length})`);
+
+  // Opt in via include_superseded: true.
+  const pack2 = await queryDecisions(
+    { scope_type: "directory", scope_id: "packages/foo", include_superseded: true },
+    tmpDir,
+  );
+  assert(pack2.recently_superseded.length === 1, `include_superseded=true: same-scope visible (got ${pack2.recently_superseded.length})`);
+  assert(
+    pack2.recently_superseded[0]?.match_reason === "scope_hit",
+    `match_reason === scope_hit (NOT cross_scope_supersede) (got ${pack2.recently_superseded[0]?.match_reason})`,
+  );
+}
+
+async function testM_configDefaultIncludeSuperseded(tmpDir: string): Promise<void> {
+  console.error("\nTest M: config-default bridge — retrieval.include_superseded = true without param (council C3)");
+
+  // Seed a config that flips include_superseded on at the config level.
+  await writeConfig(tmpDir, { retrieval: { include_superseded: true } });
+
+  const dC = makeDecision({
+    id: generateDecisionId(),
+    evidence_type: "explicit_manual",
+    durability: "precedent",
+    scope: { type: "directory", id: "packages/foo" },
+    summary: "old same-scope",
+  });
+  const dD = makeDecision({
+    id: generateDecisionId(),
+    evidence_type: "explicit_manual",
+    durability: "precedent",
+    scope: { type: "directory", id: "packages/foo" },
+    summary: "new same-scope replacement",
+  });
+  await appendToLedger(dC, tmpDir);
+  await appendToLedger(dD, tmpDir);
+  await appendToLedger(
+    makeTransition({
+      target_id: dC.id,
+      action: "supersede",
+      replaced_by: dD.id,
+      reason: "refined",
+    }),
+    tmpDir,
+  );
+
+  // No include_superseded param; config should bridge.
+  const pack = await queryDecisions({ scope_type: "directory", scope_id: "packages/foo" }, tmpDir);
+  assert(pack.recently_superseded.length === 1, `config bridge: same-scope visible (got ${pack.recently_superseded.length})`);
+}
+
+// ── v1.2.2 Monorepo-Root Fallback Test ───────────────────────────────────────
+
+async function testI_monorepoRootFallback(tmpDir: string): Promise<void> {
+  console.error("\nTest I: Monorepo-root fallback derives packages/<pkg> and apps/<app>");
+
+  // Seed a decision so the ledger isn't empty (not required for scope derivation,
+  // but keeps the query path representative).
+  const d = makeDecision({
+    id: generateDecisionId(),
+    evidence_type: "explicit_manual",
+    durability: "precedent",
+    scope: { type: "directory", id: "packages/foo" },
+    affected_files: ["packages/foo/src/bar.ts"],
+    summary: "foo decision",
+  });
+  await appendToLedger(d, tmpDir);
+
+  // packages/<pkg> path
+  const pack1 = await queryDecisions({ file_path: "packages/foo/src/bar.ts" }, tmpDir);
+  assert(pack1.derived_scope?.source === "monorepo_root", "packages/foo/src/bar.ts → monorepo_root");
+  assert(pack1.derived_scope?.id === "packages/foo", "id === packages/foo");
+
+  // apps/<app> path
+  const pack2 = await queryDecisions({ file_path: "apps/web/pages/index.tsx" }, tmpDir);
+  assert(pack2.derived_scope?.source === "monorepo_root", "apps/web/pages/index.tsx → monorepo_root");
+  assert(pack2.derived_scope?.id === "apps/web", "id === apps/web");
+
+  // Regression: non-monorepo path still uses directory_fallback
+  const pack3 = await queryDecisions({ file_path: "src/ledger/fold.ts" }, tmpDir);
+  assert(pack3.derived_scope?.source === "directory_fallback", "src/ledger/fold.ts → directory_fallback");
+  assert(pack3.derived_scope?.id === "ledger", "id === ledger");
+}
+
 // ── Runner ───────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -679,6 +870,11 @@ async function main(): Promise<void> {
     testF_zeroWriteContract,
     testG_responseShapeSnapshot,
     testH_recencyFallbackCap,
+    testI_monorepoRootFallback,
+    testJ_crossScopeSupersedeDefault,
+    testK_crossScopeSupersedeOptOut,
+    testL_sameScopeStillRequiresIncludeSuperseded,
+    testM_configDefaultIncludeSuperseded,
   ];
 
   const dirs: string[] = [];

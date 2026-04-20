@@ -10,7 +10,7 @@ import { loadConfig } from "../config.js";
 import type { LedgerConfig } from "../config.js";
 import { deriveScope, type DerivedScope } from "../retrieval/index.js";
 import { classifyCommit } from "./classify.js";
-import type { ClassifyResult, ParsedPackageJson } from "./classify.js";
+import type { ClassifyResult, ParsedPackageJson, GitignoreDiff } from "./classify.js";
 import { synthesizeDraft } from "./drafter.js";
 
 // ── Debug ────────────────────────────────────────────────────────────────────
@@ -273,6 +273,35 @@ function parsePackageJsonDiff(projectRoot: string): ParsedPackageJson | null {
   }
 }
 
+function parseGitignoreDiff(projectRoot: string, path: string): GitignoreDiff | null {
+  try {
+    // Guard: HEAD~1 may not exist on the initial commit. Silence stderr
+    // so a missing parent doesn't pollute the diagnostic channel.
+    execSync("git rev-parse --verify HEAD~1^{commit}", {
+      cwd: projectRoot,
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+
+    // git diff --numstat HEAD~1 HEAD -- <path>
+    // Output format: "<added>\t<removed>\t<path>" (tab-separated).
+    // For binary/non-text diffs git emits "-\t-\t<path>" — parseInt("-")
+    // returns NaN, caught by Number.isFinite below → returns null.
+    const raw = execSync(`git diff --numstat HEAD~1 HEAD -- "${path}"`, {
+      cwd: projectRoot,
+      encoding: "utf8",
+      stdio: "pipe",
+    }).trim();
+    if (!raw) return { added_lines: 0, removed_lines: 0 };
+    const parts = raw.split(/\s+/);
+    const added = parseInt(parts[0], 10);
+    const removed = parseInt(parts[1], 10);
+    if (!Number.isFinite(added) || !Number.isFinite(removed)) return null;
+    return { added_lines: added, removed_lines: removed };
+  } catch {
+    return null;
+  }
+}
+
 function parseEnvChanges(projectRoot: string): string[] | null {
   try {
     const current = execSync("git show HEAD:.env.example", { cwd: projectRoot, encoding: "utf8", stdio: "pipe" });
@@ -370,7 +399,19 @@ export async function postCommit(): Promise<void> {
       ? parseEnvChanges(projectRoot)
       : null;
 
-    const results = classifyCommit(diff.all, diff.deleted, diff.added, subject, config, pkgDiff);
+    // v1.2.2 council C1 — compute gitignore diff when a .gitignore anywhere
+    // in the tree is the ONLY file (root or subdirectory). The hook gate and
+    // the classifier predicate must agree on "sole .gitignore" semantics;
+    // here, both use basename === ".gitignore".
+    // Keeps the hook under 100ms: the extra git call fires at most once per
+    // commit, only for gitignore-only commits.
+    const soleGitignorePath =
+      diff.all.length === 1 && diff.all[0].toLowerCase().split("/").pop() === ".gitignore"
+        ? diff.all[0]
+        : null;
+    const gitignoreDiff = soleGitignorePath ? parseGitignoreDiff(projectRoot, soleGitignorePath) : null;
+
+    const results = classifyCommit(diff.all, diff.deleted, diff.added, subject, config, pkgDiff, gitignoreDiff);
     if (results.length === 0) {
       debug("no actionable classifications");
       return;

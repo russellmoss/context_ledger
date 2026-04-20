@@ -19,6 +19,11 @@ export interface ParsedPackageJson {
   otherChanges: boolean;
 }
 
+export interface GitignoreDiff {
+  added_lines: number;
+  removed_lines: number;
+}
+
 // ── Path Helpers ─────────────────────────────────────────────────────────────
 
 function norm(p: string): string {
@@ -128,6 +133,26 @@ const DEFAULT_BACKUP_PATTERNS = [
   ".DS_Store", "Thumbs.db",
 ];
 
+// v1.2.2 seed-rule constants
+const LOCKFILE_MANIFEST_MAP: Record<string, string> = {
+  "package-lock.json": "package.json",
+  "yarn.lock": "package.json",
+  "pnpm-lock.yaml": "package.json",
+  "poetry.lock": "pyproject.toml",
+  "Cargo.lock": "Cargo.toml",
+  "Gemfile.lock": "Gemfile",
+  "go.sum": "go.mod",
+};
+
+const IDE_CONFIG_PREFIXES: readonly string[] = [
+  ".vscode/",
+  ".idea/",
+  ".fleet/",
+  ".devcontainer/",
+];
+// NOTE: .github/ is intentionally excluded — it contains CI workflows which
+// are classifiable material (not per-developer config).
+
 function compileBackupPatterns(patterns: string[]): RegExp[] {
   const compiled: RegExp[] = [];
   const seenBad = new Set<string>();
@@ -151,6 +176,95 @@ function isEditorBackup(filepath: string, compiledPatterns: RegExp[]): boolean {
   if (filename.length === 0) return false;
   for (const rx of compiledPatterns) if (rx.test(filename)) return true;
   return false;
+}
+
+// ── Seed Rules (v1.2.2) ──────────────────────────────────────────────────────
+// Each predicate is whole-commit: returns shouldSuppress=true only if the
+// ENTIRE changeset matches the rule's conditions. First match wins; reason is
+// logged via console.error for the inbox diagnostic trail.
+
+export interface SeedRuleOutcome {
+  shouldSuppress: boolean;
+  reason: string;
+}
+
+function isGitignoreTrivialCommit(
+  meaningful: string[],
+  gitignoreDiff: GitignoreDiff | null | undefined,
+): SeedRuleOutcome {
+  // Only fires when every meaningful file is .gitignore AND the diff is
+  // a single-line add/remove. If gitignoreDiff is null/undefined (hook did
+  // not bother to compute it), the rule does NOT suppress.
+  const gitignoreOnly =
+    meaningful.length > 0 &&
+    meaningful.every((f) => {
+      const parts = normLower(f).split("/");
+      return parts[parts.length - 1] === ".gitignore";
+    });
+  if (!gitignoreOnly) {
+    return { shouldSuppress: false, reason: "not gitignore-only" };
+  }
+  if (!gitignoreDiff) {
+    return { shouldSuppress: false, reason: "gitignore diff not available" };
+  }
+  const totalLines = gitignoreDiff.added_lines + gitignoreDiff.removed_lines;
+  if (totalLines !== 1) {
+    return { shouldSuppress: false, reason: `gitignore multi-line (${totalLines} lines)` };
+  }
+  return { shouldSuppress: true, reason: "gitignore_trivial: single-line .gitignore change" };
+}
+
+function isIdeConfigOnlyCommit(meaningful: string[]): SeedRuleOutcome {
+  if (meaningful.length === 0) {
+    return { shouldSuppress: false, reason: "no files" };
+  }
+  const allIde = meaningful.every((f) => {
+    const n = normLower(f);
+    return IDE_CONFIG_PREFIXES.some((p) => n.startsWith(p));
+  });
+  if (!allIde) {
+    return { shouldSuppress: false, reason: "not IDE-config-only" };
+  }
+  return { shouldSuppress: true, reason: "ide_config_only: all files under per-developer IDE config dirs" };
+}
+
+function isLockfileOnlyCommit(meaningful: string[]): SeedRuleOutcome {
+  if (meaningful.length === 0) {
+    return { shouldSuppress: false, reason: "no files" };
+  }
+
+  // Compute { parentDir, basename } for every file.
+  // v1.2.2 council C4: basename-only comparison is path-insensitive and
+  // breaks on monorepos. Compare lockfiles to their MATCHING-DIRECTORY
+  // manifests, not to any manifest anywhere in the changeset.
+  type FileEntry = { dir: string; base: string };
+  const entries: FileEntry[] = meaningful.map((f) => {
+    const n = norm(f);
+    const parts = n.split("/");
+    return {
+      base: parts[parts.length - 1],
+      dir: parts.slice(0, -1).join("/"),
+    };
+  });
+
+  // Every file must be a known lockfile (by basename).
+  const allLockfiles = entries.every((e) => e.base in LOCKFILE_MANIFEST_MAP);
+  if (!allLockfiles) {
+    return { shouldSuppress: false, reason: "not lockfile-only" };
+  }
+
+  // For EACH lockfile, the MATCHING manifest in the SAME directory must be absent.
+  // If any lockfile has its sibling manifest in the changeset, do NOT suppress —
+  // that's a dependency-change commit, handled by the existing Tier 1 detector.
+  const byPath = new Set(entries.map((e) => (e.dir ? `${e.dir}/${e.base}` : e.base)));
+  for (const entry of entries) {
+    const manifestBase = LOCKFILE_MANIFEST_MAP[entry.base];
+    const manifestPath = entry.dir ? `${entry.dir}/${manifestBase}` : manifestBase;
+    if (byPath.has(manifestPath)) {
+      return { shouldSuppress: false, reason: `manifest present in same directory — dependency change for ${entry.dir || "root"}` };
+    }
+  }
+  return { shouldSuppress: true, reason: "lockfile_only: lockfiles without matching-directory manifests" };
 }
 
 function detectNewDirectory(added: string[], changed: string[]): { dir: string; files: string[] } | null {
@@ -197,6 +311,7 @@ export function classifyCommit(
   commitMessage: string,
   config: LedgerConfig,
   packageJsonDiff?: ParsedPackageJson | null,
+  gitignoreDiff?: GitignoreDiff | null,
 ): ClassifyResult[] {
   if (!config.capture.enabled) return [];
 
@@ -220,6 +335,32 @@ export function classifyCommit(
     .filter((f) => !isStyleFile(f) || CONFIG_PATTERN.test(normLower(f)));
 
   if (meaningful.length === 0) return [];
+
+  // v1.2.2 seed rules — whole-commit suppressions. Evaluated in declared
+  // order: gitignore_trivial → ide_config_only → lockfile_only. First match
+  // wins; classifier returns [] to signal "not actionable, do not inbox".
+  const seedRules = config.capture.classifier?.seed_rules;
+  if (seedRules?.gitignore_trivial ?? true) {
+    const outcome = isGitignoreTrivialCommit(meaningful, gitignoreDiff);
+    if (outcome.shouldSuppress) {
+      console.error(`[context-ledger:classify] suppressed: ${outcome.reason}`);
+      return [];
+    }
+  }
+  if (seedRules?.ide_config_only ?? true) {
+    const outcome = isIdeConfigOnlyCommit(meaningful);
+    if (outcome.shouldSuppress) {
+      console.error(`[context-ledger:classify] suppressed: ${outcome.reason}`);
+      return [];
+    }
+  }
+  if (seedRules?.lockfile_only ?? true) {
+    const outcome = isLockfileOnlyCommit(meaningful);
+    if (outcome.shouldSuppress) {
+      console.error(`[context-ledger:classify] suppressed: ${outcome.reason}`);
+      return [];
+    }
+  }
 
   const results: ClassifyResult[] = [];
   const claimedFiles = new Set<string>(); // files already assigned to a result

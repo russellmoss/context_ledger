@@ -1,4 +1,4 @@
-# context-ledger: Design Document v2.4.1
+# context-ledger: Design Document v2.4.2
 
 ## What This Document Is
 
@@ -476,10 +476,10 @@ A lightweight MCP server exposed as `npx context-ledger serve` (or a global `con
 **The retrieval contract:**
 
 1. The caller provides a `file_path`, a natural language `query`, or both.
-2. If `file_path` is provided, the server derives scope by consulting `scope_mappings` in config, then `scope_aliases` in existing records, then falling back to the top-level directory name as scope ID. This is the primary retrieval path for agent workflows.
+2. If `file_path` is provided, the server derives scope by consulting `scope_mappings` in config, then `scope_aliases` in existing records, then the **monorepo-root fallback** (returns `packages/<pkg>` for paths under `packages/`, `apps/`, or `services/`), then falling back to the top-level directory name as scope ID. This is the primary retrieval path for agent workflows.
 3. **v2.3 change: Deterministic fallback order for query-only calls.** When no `file_path` or explicit scope params are provided, the server resolves scope candidates in this exact order:
    1. Explicit `scope_type` + `scope_id` params (if provided — highest priority)
-   2. `file_path`-derived scope via `scope_mappings` → `scope_aliases` → directory fallback (if `file_path` provided)
+   2. `file_path`-derived scope via `scope_mappings` → `scope_aliases` → `monorepo_root` → directory fallback (if `file_path` provided)
    3. `feature_hint_mappings` phrase matches against the `query` string (deterministic, configurable — see Configuration section). The server tokenizes the query, matches tokens against `feature_hint_mappings` keys, and unions the mapped scope candidates. For example, a query mentioning "drill-down export" would match `"drill-down" → ["query-layer"]` and `"export" → ["export-format"]`, returning precedents from both scopes.
    4. Pure recency fallback: N most recently active precedents — last resort only, used when no other derivation is possible.
    
@@ -947,6 +947,9 @@ These are the arbitrated outcomes from adversarial review. v2 decisions are from
 | **v2.4.1: Hook-drafted inbox items populate scope fields** | Pre-v1.2.1, hook-drafted inbox items emitted `proposed_decision` payloads without `scope_type`, `scope_id`, `affected_files`, or `scope_aliases`. Those drafts were orphans — invisible to file-path queries, to `mistakes_in_scope`, and to scope-derived retrieval. Fixed by calling the existing `deriveScope` helper at draft time and enriching the payload. Highest-impact of the four dogfood bugs: the hook is the dominant capture path and its drafts now retrieve correctly. | dogfood 2026-04-19 |
 | **v2.4.1: Same-day revert suppression** | Hook drafter suppresses drafts when a feat+revert pair lands inside a configurable window (default 24h, `capture.drafter.revert_suppression_window_hours`). Suppression is body-keyed (`This reverts commit <40-char SHA>`), not subject-keyed — robust to `--no-edit`, manual rewrites, and cherry-picked reverts. Uses committer date (`%ct`) to avoid cherry-pick ambiguity. Fails open on git errors: the drafter proceeds normally rather than silently skipping. Timing semantics: suppression halves the noise (the revert's draft is skipped), it does not retroactively erase the feat's draft — that would require rewriting `inbox.jsonl` and violate append-only. | dogfood 2026-04-19 |
 | **v2.4.1: Editor-backup file-deletion suppression** | `file-deletion` Tier 1 classifier skips commits whose every deletion matches a configurable editor-backup glob (`capture.classifier.editor_backup_patterns`, default: `*.bak`, `*.orig`, `*.swp`, `*.swo`, `*~`, `.#*`, `.DS_Store`, `Thumbs.db`). Mixed commits (backup + real source deletion) still classify the real deletion. Patterns are filename-segment-only — path prefixes in globs are ignored. Narrow scope: Tier 2 detectors (module replacement, feature removal, auth-security) remain unaffected in v2.4.1; widen in a follow-up if dogfood shows noise there. | dogfood 2026-04-19 |
+| **v2.4.2: Cross-scope supersede traversal in `recently_superseded` (one hop via `replaced_by`), surfaced at default params.** | Audit trails where a narrower-scoped decision is superseded by a broader one were invisible when querying by the broader scope. These entries are genealogy of the in-scope record, not stale history, so they surface even when `include_superseded: false`. Same-scope supersedes continue to require the flag. Opt-out per query via new `include_cross_scope_supersede: false` param (default `true`). One-hop traversal, no chaining, no new event types. | dogfood 2026-04-19 to 2026-04-20 |
+| **v2.4.2: Monorepo-root fallback in `deriveScope` for `packages/`, `apps/`, `services/` paths.** | Previously basenames like `report-generator.ts` were returned as scope ids, which is misleading in decision-pack output. New `monorepo_root` source returns `packages/<pkg>` form. | dogfood 2026-04-19 to 2026-04-20 |
+| **v2.4.2: Three seed-rule classifier suppressions (`gitignore_trivial`, `ide_config_only`, `lockfile_only`), config-gated, default on.** | These commits carry no decision value and were polluting the inbox and the future learning layer's rejection signal. Deterministic suppressions fire at N=0 for every user from commit #1. | dogfood 2026-04-19 to 2026-04-20 |
 
 ---
 

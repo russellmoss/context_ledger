@@ -11,6 +11,7 @@ export type ScopeSource =
   | "config_mapping"
   | "scope_alias"
   | "directory_fallback"
+  | "monorepo_root"
   | "feature_hint"
   | "recency_fallback";
 
@@ -24,6 +25,21 @@ export interface DerivedScope {
 
 export function normalizePath(p: string): string {
   return p.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+}
+
+// ── Monorepo Root Detection (v1.2.2) ─────────────────────────────────────────
+// When a path lives under a common monorepo root (packages/, apps/, services/),
+// return the top-level package directory id like "packages/foo". Preserves
+// current directory-fallback behavior for unrecognized paths.
+const MONOREPO_ROOTS: readonly string[] = ["packages", "apps", "services"];
+
+function deriveMonorepoRootScope(segments: string[]): { id: string } | null {
+  if (segments.length < 2) return null;
+  const first = segments[0];
+  if (!MONOREPO_ROOTS.includes(first)) return null;
+  const pkg = segments[1];
+  if (!pkg || pkg.startsWith(".")) return null;
+  return { id: `${first}/${pkg}` };
 }
 
 // ── Main Scope Derivation ────────────────────────────────────────────────────
@@ -72,8 +88,15 @@ export function deriveScope(
       }
     }
 
-    // 2c: Directory fallback
+    // 2c: Monorepo-root fallback (v1.2.2) — walks "packages/<pkg>/..." paths
+    // to their top-level package directory before falling back to basename.
     const segments = normalized.split("/").filter((s) => s !== "" && s !== "." && s !== "..");
+    const monorepo = deriveMonorepoRootScope(segments);
+    if (monorepo) {
+      return { type: "directory", id: monorepo.id, source: "monorepo_root" };
+    }
+
+    // 2d: Directory fallback (original behavior for non-monorepo paths)
     const srcIndex = segments.indexOf("src");
     let scopeId: string | null = null;
 
