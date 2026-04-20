@@ -1,62 +1,151 @@
-# Agentic Implementation Guide — `mistakes_in_scope` in Decision Pack
+# Agentic Implementation Guide — v1.2.1 Dogfood Bug Fixes
 
-**Feature:** Surface antipatterns first in the decision pack returned by `query_decisions`.
-**Spec:** context-ledger-design-v2.md (Retrieval section — to be extended in Phase 8)
-**Exploration:** exploration-results.md, code-inspector-findings.md, pattern-finder-findings.md
-**North star:** Autonomy axis #1 (retrieval quality). Strictly additive. No fold/event/hook changes.
+Four bugs surfaced from real-world dogfood use on 2026-04-19. Patch release — zero new capabilities, zero new runtime deps, patch-level version bump. All four touch the capture/inbox path; none touch the `ledger.jsonl` event schema.
 
----
+**Bugs:**
+- **Bug 7 (payload-key unification)**: hook drafter writes under `proposed_decision`, MCP writes under `proposed_record`. Unify on `proposed_record`; keep `proposed_decision` as a legacy read-only alias.
+- **Bug 8 (scope-field population)**: hook-drafted inbox items lack `scope_type`/`scope_id`/`affected_files`/`scope_aliases`. Populate via existing `deriveScope`.
+- **Bug 9 (same-day-revert suppression)**: feat+revert within a configurable window produces zero inbox items (for the revert's hook invocation).
+- **Bug 10 (editor-backup suppression)**: `file-deletion` classifier drops deletions whose files all match editor-backup globs.
 
-## How To Execute This Guide
+**Invariants (never violate):**
+- All imports use `.js` extensions (Node16 module resolution).
+- JSONL writes are append-only with trailing newline — never mutate existing lines.
+- All events conform to the schema in `context-ledger-design-v2.md`. This patch changes NO event schemas.
+- MCP tools include annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`). This patch adds no tools and changes no annotations.
+- Post-commit hook <100ms, zero LLM, zero network in the synchronous hot path. Revert-check shellout must fail open.
+- Zero runtime dependencies added. Existing deps: `@anthropic-ai/sdk`, `@clack/prompts`, `@modelcontextprotocol/sdk`, `zod`.
+- `commit_inferred` records (weight 0.2) remain excluded from all auto-promotion, including `mistakes_in_scope`.
+- Feature-local durability stays default-excluded from queries.
+- Import merges, not additions — never add a second import from the same module.
+- Zero console.log in `src/index.ts` — stdout reserved for MCP JSON-RPC.
 
-- Execute phases in order. Do not skip.
-- At each **STOP AND REPORT** checkpoint: print what changed, print validation output, wait for the user's go-ahead before continuing.
-- Every validation gate is concrete bash. If a gate fails, fix before proceeding.
-- Import merges, not additions. Never add a second `import` from the same module.
-- All imports use `.js` extensions (Node16 resolution). No exceptions.
-- Append-only JSONL. This feature does not write JSONL at all; any attempt to do so is a bug.
-- Post-commit hook is untouched. Verify after every phase: `git diff --stat src/capture/ | wc -l` must be `0`.
-- Make one commit per phase, with a message prefix `feat(retrieval-mistakes):`. Pre-commit hook runs in blocking mode — update docs before committing or the commit is rejected.
-
----
-
-## Phase 0 — Context Load (read-only, 5 min)
-
-Read these files fully before touching code:
-- `context-ledger-design-v2.md` — Retrieval section + Decision Pack Response schema
-- `CLAUDE.md` — invariants
-- `src/retrieval/packs.ts` — single DecisionPack construction site at lines 117–126
-- `src/retrieval/query.ts` — orchestrator
-- `src/retrieval/scope.ts` — `deriveScope`, `normalizePath`, `deriveScopeFromHints`
-- `src/mcp/read-tools.ts` — `query_decisions` registration
-- `src/mcp/write-tools.ts:245–275` — `reject_pending` handler (dynamic `rejection_reason` write)
-- `src/ledger/events.ts` — `InboxItem` interface at lines 88–103
-- `src/retrieval/smoke-test.ts` — test harness pattern
-
-**Design decisions locked by user (council pass 1 triage):**
-1. **Trim order → Option A (spec-literal).** Over-budget packs trim `active_precedents` from the tail FIRST, then `recently_superseded`, then `abandoned_approaches`, then cap `pending_inbox_items`, and `mistakes_in_scope` is the last casualty. Antipatterns are the irrecoverable signal under token pressure.
-2. **`include_feature_local` → Option A (global short-circuit).** Flag bypasses the existing feature-local filter entirely for all sections.
-3. **CLI → Replace.** Swap `searchDecisions` for `queryDecisions` in the CLI `query` handler. Render the full decision pack. The CLI becomes a faithful debugging mirror of what the agent sees over MCP.
-4. **`rejection_reason` on `InboxItem` → Ratify.** Promote to a typed optional field. Remove the `as unknown as Record<string, unknown>` cast. This is NOT an event-schema change (InboxItem is a workflow queue entry, not a `DecisionRecord` / `TransitionEvent`) — but Phase 8 MUST document it as an explicit, separate spec decision.
-5. **Recency fallback → Include capped at N=10.** When `derivedScope === null`, include the N=10 most recent dismissed inbox items with `rejection_reason`, sorted by `rejected_at` desc. Honors the "every scope-derivation path" instruction.
+**Before you start:** read `context-ledger-design-v2.md`, `code-inspector-findings.md`, `pattern-finder-findings.md`, `exploration-results.md`. This guide assumes familiarity with all four.
 
 ---
 
-## Phase 1 — Type Definitions (intentionally breaks the build)
+## Phase 0: Pre-Flight
 
-**Goal:** add types for `MistakeEntry`, `mistakes_in_scope`, typed `rejection_reason`, and `include_feature_local`. Build will fail at the pack construction site — that's the checklist.
+**Goal:** prove the working tree is clean and the current master builds green before any edit.
 
-### 1.1 Extend `InboxItem` with typed `rejection_reason`
-
-**File:** `src/ledger/events.ts`
-
-Locate the `InboxItem` interface (lines 88–103). Add one field right before the closing brace:
-
-```ts
-  rejection_reason?: string;
+**Actions:**
+```bash
+cd C:/Users/russe/Documents/Context_Ledger
+git status --porcelain
+git log -1 --oneline
+npm run build 2>&1 | tail -20
 ```
 
-Final `InboxItem`:
+**Validation gate:**
+- `git status --porcelain` prints nothing (clean tree).
+- `git log -1 --oneline` shows current master (v1.2.0 release commit or later).
+- `npm run build` exits 0 with no errors.
+
+**STOP AND REPORT:** if the working tree is dirty, stop and ask the user. Do not stash or discard. If build fails on current master, stop — that's a pre-existing problem outside this patch.
+
+---
+
+## Phase 1: Blocking Prerequisites — none
+
+There are no external prereqs. No new deps, no new schema, no infrastructure. Proceed directly to Phase 2.
+
+**STOP AND REPORT:** none.
+
+---
+
+## Phase 2: Type Definitions (intentionally breaks the build)
+
+**Goal:** extend config types and `ProposedDecisionDraft` / `InboxItem`. This INTENTIONALLY breaks the build in a small, enumerable set of downstream files — the errors become the checklist for Phases 3–6.
+
+### 2a. `src/config.ts`
+
+**Edit 1** — extend `DrafterCaptureConfig` (currently lines 15-20):
+
+```ts
+export interface DrafterCaptureConfig {
+  enabled: boolean;
+  model?: string;
+  timeout_ms?: number;
+  max_diff_chars?: number;
+  revert_suppression_window_hours?: number;  // v1.2.1 — default 24
+}
+```
+
+**Edit 2** — add new `ClassifierCaptureConfig` after `DrafterCaptureConfig` (before `LedgerConfig`):
+
+```ts
+export interface ClassifierCaptureConfig {
+  editor_backup_patterns: string[];
+}
+```
+
+**Edit 3** — extend `LedgerConfig.capture` (lines 22-33) with `classifier` placed right after `drafter`:
+
+```ts
+export interface LedgerConfig {
+  capture: {
+    enabled: boolean;
+    ignore_paths: string[];
+    scope_mappings: Record<string, ScopeMapping>;
+    redact_patterns: string[];
+    no_capture_marker: string;
+    inbox_ttl_days: number;
+    inbox_max_prompts_per_item: number;
+    inbox_max_items_per_session: number;
+    drafter: DrafterCaptureConfig;
+    classifier: ClassifierCaptureConfig;          // NEW
+  };
+  // ... rest unchanged
+}
+```
+
+**Edit 4** — extend `DEFAULT_CONFIG.capture` (lines 55-66):
+
+```ts
+export const DEFAULT_CONFIG: LedgerConfig = {
+  capture: {
+    enabled: true,
+    ignore_paths: ["dist/", "node_modules/", ".next/", "coverage/", ".agent-guard/", ".cursor/", ".claude/"],
+    scope_mappings: {},
+    redact_patterns: [],
+    no_capture_marker: "[no-capture]",
+    inbox_ttl_days: 14,
+    inbox_max_prompts_per_item: 3,
+    inbox_max_items_per_session: 3,
+    drafter: { enabled: true, revert_suppression_window_hours: 24 },
+    classifier: { editor_backup_patterns: ["*.bak", "*.orig", "*.swp", "*.swo", "*~", ".#*"] },
+  },
+  // ... rest unchanged
+};
+```
+
+### 2b. `src/ledger/events.ts`
+
+**Edit 5** — extend `ProposedDecisionDraft` (lines 78-86) with optional scope fields. Keep every existing field exactly as-is:
+
+```ts
+export interface ProposedDecisionDraft {
+  summary: string;
+  decision: string;
+  rationale: string;
+  alternatives_considered: AlternativeConsidered[];
+  decision_kind: string;
+  tags: string[];
+  durability: Durability;
+  // v1.2.1 additions — optional so legacy drafts still validate
+  scope_type?: ScopeType;
+  scope_id?: string;
+  affected_files?: string[];
+  scope_aliases?: string[];
+  revisit_conditions?: string;
+  review_after?: string | null;
+}
+```
+
+If `ScopeType` is not already imported in this file, merge it into the existing type import from `events.ts`'s companion module (do NOT add a second import line). Inspect the top of `events.ts` for existing type imports.
+
+**Edit 6** — extend `InboxItem` (lines 88-104) with the canonical `proposed_record` alongside the legacy `proposed_decision`:
+
 ```ts
 export interface InboxItem {
   inbox_id: string;
@@ -72,1026 +161,1131 @@ export interface InboxItem {
   times_shown: number;
   last_prompted_at: string | null;
   status: InboxStatus;
-  proposed_decision?: ProposedDecisionDraft;
+  proposed_record?: ProposedDecisionDraft;   // v1.2.1 — canonical going forward
+  proposed_decision?: ProposedDecisionDraft; // LEGACY — read-only alias for pre-v1.2.1 data
   rejection_reason?: string;
 }
 ```
 
-### 1.2 Add `MistakeEntry` discriminated union to `src/retrieval/packs.ts`
-
-Insert immediately after the `SupersededEntry` interface (after line 29, before `DecisionPack`):
-
-```ts
-export type MistakeEntry =
-  | {
-      kind: "superseded_with_pain_points";
-      record: DecisionRecord;
-      match_reason: MatchReason;
-      pain_points: string[];
-      replaced_by: string;
-    }
-  | {
-      kind: "abandoned";
-      record: DecisionRecord;
-      match_reason: MatchReason;
-      reason: string;
-      pain_points: string[];
-    }
-  | {
-      kind: "rejected_inbox_item";
-      inbox_id: string;
-      commit_sha: string;
-      commit_message: string;
-      changed_files: string[];
-      rejection_reason: string;
-      rejected_at: string;
-    };
-```
-
-### 1.3 Add `mistakes_in_scope` to `DecisionPack` (packs.ts:31–40)
-
-```ts
-export interface DecisionPack {
-  derived_scope: DerivedScope | null;
-  active_precedents: PackEntry[];
-  abandoned_approaches: AbandonedEntry[];
-  recently_superseded: SupersededEntry[];
-  pending_inbox_items: InboxItem[];
-  mistakes_in_scope: MistakeEntry[];
-  no_precedent_scopes: string[];
-  token_estimate: number;
-  truncated: boolean;
-}
-```
-
-### 1.4 Initialize `mistakes_in_scope: []` at the single construction site (packs.ts:117–126)
-
-```ts
-  const pack: DecisionPack = {
-    derived_scope: scope,
-    active_precedents: paginatedActive,
-    abandoned_approaches: abandonedApproaches,
-    recently_superseded: recentlySuperseded,
-    pending_inbox_items: pendingInbox,
-    mistakes_in_scope: [],
-    no_precedent_scopes: noPrecedentScopes,
-    token_estimate: 0,
-    truncated: false,
-  };
-```
-
-(Population logic lands in Phase 2. This keeps build green after Phase 1.)
-
-### 1.5 Add `include_feature_local` to `QueryDecisionsParams` (query.ts:15–26)
-
-```ts
-export interface QueryDecisionsParams {
-  file_path?: string;
-  query?: string;
-  scope_type?: string;
-  scope_id?: string;
-  decision_kind?: string;
-  tags?: string[];
-  include_superseded?: boolean;
-  include_unreviewed?: boolean;
-  include_feature_local?: boolean;
-  limit?: number;
-  offset?: number;
-}
-```
-
-### 1.6 Re-export `MistakeEntry` from retrieval barrel
-
-**File:** `src/retrieval/index.ts` line 7. Add `MistakeEntry` to the existing type re-export:
-
-```ts
-export type { MatchReason, PackEntry, AbandonedEntry, SupersededEntry, MistakeEntry, DecisionPack } from "./packs.js";
-```
-
-### 1.7 Add `include_feature_local` to the MCP Zod schema
-
-**File:** `src/mcp/read-tools.ts` inside the `query_decisions` schema object (lines 12–23). Add a new entry after `include_unreviewed`:
-
-```ts
-      include_feature_local: z.boolean().optional().describe("Include feature-local durability records (overrides the default file-path-match requirement). Default false."),
-```
-
-### Phase 1 Validation Gate
-
-Run:
+### Validation gate — Phase 2
 
 ```bash
-npm run build 2>&1 | tee /tmp/ctx-build-p1.log
-grep -c "error TS" /tmp/ctx-build-p1.log || echo "0 errors"
-grep "error TS" /tmp/ctx-build-p1.log | awk '{print $1}' | sort -u
+npx tsc --noEmit 2>&1 | tee /tmp/phase2.log
+grep -c "error TS" /tmp/phase2.log
+grep "error TS" /tmp/phase2.log | awk -F'(' '{print $1}' | sort -u
 ```
 
-**Expected:** zero TS errors. (Phase 1 was designed to avoid type errors because `mistakes_in_scope: []` and the new optional field `rejection_reason?` are both safe additions.)
+Expected: non-zero error count. The unique error-bearing files should be exactly:
+- `src/capture/hook.ts` (writes to the renamed field)
+- `src/capture/hook.test.ts` (9 assertions on old key name)
+- (possibly) `src/mcp/write-tools.ts` — may be clean already since it already reads `proposed_record`.
 
-Also verify:
+If ANY other source file appears in the error set, STOP — something unexpected is depending on the old shape.
 
-```bash
-grep -n "mistakes_in_scope" src/retrieval/packs.ts
-grep -n "rejection_reason" src/ledger/events.ts
-grep -n "include_feature_local" src/retrieval/query.ts src/mcp/read-tools.ts
-grep -n "MistakeEntry" src/retrieval/index.ts
-git diff --stat src/capture/ | wc -l
-```
+### STOP AND REPORT — end of Phase 2
 
-**Expected:**
-- `mistakes_in_scope` present in `DecisionPack` and construction site.
-- `rejection_reason?: string` present in `InboxItem` (only if Q2 = ratify — see Q-gate below).
-- `include_feature_local` present in both files.
-- `MistakeEntry` re-exported.
-- `src/capture/` untouched — wc line count `0`.
-
-Additional construction-site safety check (Bucket 1 fix 1.4):
-
-```bash
-# Must be 0 — no other DecisionPack construction sites exist
-grep -rn ": DecisionPack" src/ | grep -v "src/retrieval/packs.ts" | wc -l
-```
-
-**Note on MCP response contract (Bucket 1 fix 1.9):** MCP `query_decisions` returns `JSON.stringify(pack, null, 2)` without a Zod response schema. The response-shape change is implicit via the `DecisionPack` TypeScript interface. No MCP server code changes besides the input Zod schema and tool description.
-
-**STOP AND REPORT** — show the build output, grep results, and the 0-count for the extra construction-site grep. Wait for go-ahead. Commit: `feat(retrieval-mistakes): phase 1 — type definitions`.
+Report:
+1. Total TS error count.
+2. Unique error-bearing files.
+3. Whether the set matches expected.
+4. Any unexpected file — describe before proceeding.
 
 ---
 
-## Phase 2 — Pack Builder Logic
+## Phase 3: Classifier — editor-backup suppression (Bug 10)
 
-**Goal:** populate `mistakes_in_scope` in `buildDecisionPack`. Accept rejected inbox items as a new parameter. Respect `commit_inferred` exclusion explicitly.
+**Goal:** `src/capture/classify.ts` stops emitting `file-deletion` when every deleted file matches a configured editor-backup pattern.
 
-### 2.1 Extend `buildDecisionPack` signature
+**File:** `src/capture/classify.ts`.
 
-**File:** `src/retrieval/packs.ts` — update the function signature at lines 44–50 to accept rejected inbox items and the feature-local flag:
+### 3a. Add module-level constant and helpers (compiled-once glob matcher)
 
-```ts
-export function buildDecisionPack(
-  decisions: Array<FoldedDecision & { match_reason: MatchReason }>,
-  scope: DerivedScope | null,
-  inboxItems: InboxItem[],
-  rejectedInboxItems: InboxItem[],
-  params: { include_superseded?: boolean; include_unreviewed?: boolean; include_feature_local?: boolean; limit?: number; offset?: number },
-  config: LedgerConfig,
-): DecisionPack {
-```
-
-### 2.2 Populate `mistakes_in_scope` inside the classification loop
-
-Add this block immediately after the existing classification `for` loop (after packs.ts:92, before the sort section).
+Near the top of the file (after existing constants like `AUTH_FILE_PATTERN`, `CONFIG_PATTERN`), add:
 
 ```ts
-  // ── Mistakes in scope (antipatterns: abandoned, superseded w/ pain_points, rejected inbox) ──
-  const mistakesInScope: MistakeEntry[] = [];
+// v1.2.1 Bug 10 — default editor-backup + OS-noise patterns. Used when config.capture.classifier is absent.
+const DEFAULT_BACKUP_PATTERNS = [
+  "*.bak", "*.orig", "*.swp", "*.swo", "*~", ".#*",
+  ".DS_Store", "Thumbs.db",  // OS noise — same UX problem, zero architectural signal
+];
 
-  for (const folded of decisions) {
-    // Exclude commit_inferred from mistakes_in_scope only (not from abandoned_approaches /
-    // recently_superseded, which remain informational). Rationale: mistakes_in_scope
-    // actively shapes agent behavior (do-not-repeat) and the 0.2 weight means the record
-    // is unreviewed. Surface commit_inferred records as context via the legacy buckets only.
-    if (folded.record.evidence_type === "commit_inferred") continue;
-
-    if (folded.state === "superseded") {
-      const lastSupersede = findLastTransition(folded, "supersede");
-      const pp = lastSupersede?.pain_points ?? [];
-      if (pp.length > 0) {
-        mistakesInScope.push({
-          kind: "superseded_with_pain_points",
-          record: folded.record,
-          match_reason: folded.match_reason,
-          pain_points: pp,
-          replaced_by: folded.replaced_by ?? "",
-        });
-      }
-    } else if (folded.state === "abandoned") {
-      const lastAbandon = findLastTransition(folded, "abandon");
-      mistakesInScope.push({
-        kind: "abandoned",
-        record: folded.record,
-        match_reason: folded.match_reason,
-        reason: lastAbandon?.reason ?? "",
-        pain_points: lastAbandon?.pain_points ?? [],
-      });
-    }
-  }
-
-  for (const item of rejectedInboxItems) {
-    mistakesInScope.push({
-      kind: "rejected_inbox_item",
-      inbox_id: item.inbox_id,
-      commit_sha: item.commit_sha,
-      commit_message: item.commit_message,
-      changed_files: item.changed_files,
-      rejection_reason: item.rejection_reason ?? "",
-      rejected_at: item.last_prompted_at ?? item.created,
-    });
-  }
-
-  // Sort order per spec: (1) superseded_with_pain_points, (2) abandoned, (3) rejected_inbox_item.
-  // Within each kind, most recent first.
-  const kindOrder: Record<MistakeEntry["kind"], number> = {
-    superseded_with_pain_points: 0,
-    abandoned: 1,
-    rejected_inbox_item: 2,
-  };
-  mistakesInScope.sort((a, b) => {
-    const ko = kindOrder[a.kind] - kindOrder[b.kind];
-    if (ko !== 0) return ko;
-    const aTime = a.kind === "rejected_inbox_item" ? a.rejected_at : a.record.created;
-    const bTime = b.kind === "rejected_inbox_item" ? b.rejected_at : b.record.created;
-    return bTime.localeCompare(aTime);
-  });
-
-  // ── Dedup (Bucket 1 fix 1.1): records promoted to mistakes_in_scope must not
-  //    also appear in abandoned_approaches or recently_superseded — otherwise the
-  //    token budget double-counts them.
-  const promotedIds = new Set(
-    mistakesInScope
-      .filter((m): m is Extract<MistakeEntry, { record: DecisionRecord }> => "record" in m)
-      .map((m) => m.record.id),
-  );
-  const dedupedAbandoned = abandonedApproaches.filter((e) => !promotedIds.has(e.record.id));
-  const dedupedSuperseded = recentlySuperseded.filter((e) => !promotedIds.has(e.record.id));
-```
-
-Use `dedupedAbandoned` and `dedupedSuperseded` in the pack construction site in 2.3 below (replace `abandonedApproaches` and `recentlySuperseded`).
-
-### 2.3 Wire `mistakes_in_scope` into the pack construction site
-
-Replace the stub from Phase 1:
-
-```ts
-    mistakes_in_scope: mistakesInScope,
-```
-
-### Phase 2 Validation Gate
-
-```bash
-npm run build 2>&1 | tee /tmp/ctx-build-p2.log
-grep -c "error TS" /tmp/ctx-build-p2.log || echo "0 errors"
-grep -n "findLastTransition\|commit_inferred\|rejectedInboxItems\|mistakesInScope" src/retrieval/packs.ts
-git diff --stat src/capture/ | wc -l
-```
-
-**Expected:**
-- Zero TS errors locally for packs.ts.
-- One TS error **expected** at `src/retrieval/query.ts` where `buildDecisionPack(...)` is called — this is now called with the old arity. Phase 3 fixes the call site.
-- `src/capture/` untouched.
-
-**STOP AND REPORT** — report that the expected single call-site error at query.ts:153 is the handoff to Phase 3. Commit: `feat(retrieval-mistakes): phase 2 — pack builder populates mistakes_in_scope`.
-
----
-
-## Phase 3 — Query Orchestration
-
-**Goal:** plumb rejected inbox items and `include_feature_local` through `queryDecisions`.
-
-### 3.1 Gate the feature-local filter on `include_feature_local`
-
-**File:** `src/retrieval/query.ts` — update the filter block (lines 72–78) to respect the flag:
-
-```ts
-    // Feature-local exclusion: exclude unless exact file_path match on affected_files,
-    // OR the caller opts in via include_feature_local.
-    if (folded.record.durability === "feature-local" && !params.include_feature_local) {
-      if (!normalizedFilePath) continue;
-      const hasMatch = folded.record.affected_files.some(
-        (f) => normalizePath(f) === normalizedFilePath,
-      );
-      if (!hasMatch) continue;
-    }
-```
-
-### 3.2 Load rejected inbox items and scope-intersect
-
-Add a helper at the top of the file (or co-locate in `src/retrieval/scope.ts` — see 3.4). For brevity, inline in `query.ts` above `queryDecisions`:
-
-```ts
-// Intersects an inbox item's changed_files with the derived scope.
-// Mirrors deriveScope() in src/retrieval/scope.ts:31–102 — any future change to
-// deriveScope MUST update this helper in lockstep to prevent drift.
-//
-// Derivation order (must match scope.ts):
-//   1. config scope_mappings (longest-prefix match)
-//   2. scope_aliases on active decisions
-//   3. directory fallback (segment after `src/`)
-// Final fallback (Bucket 1 fix 1.5): if changed_files is empty, substring-match
-// scope.id against commit_message.
-function inboxItemIntersectsScope(
-  item: InboxItem,
-  scope: DerivedScope | null,
-  state: MaterializedState,
-  config: LedgerConfig,
-): boolean {
-  if (scope === null) return false; // see Q4 for recency fallback behavior
-
-  const mappings = config.capture.scope_mappings;
-
-  // Fallback: empty changed_files → commit_message substring match against scope.id.
-  if (item.changed_files.length === 0) {
-    return item.commit_message.toLowerCase().includes(scope.id.toLowerCase());
-  }
-
-  for (const file of item.changed_files) {
-    const n = normalizePath(file);
-
-    // 1. scope_mappings (longest-prefix match — mirror scope.ts:46–62)
-    for (const [prefix, target] of Object.entries(mappings)) {
-      if (n.startsWith(normalizePath(prefix)) && target.type === scope.type && target.id === scope.id) {
-        return true;
+// Compile once per invocation; skip malformed patterns with a single warning.
+function compileBackupPatterns(patterns: string[]): RegExp[] {
+  const compiled: RegExp[] = [];
+  const seenBad = new Set<string>();
+  for (const pat of patterns) {
+    try {
+      const escaped = pat.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*");
+      compiled.push(new RegExp(`^${escaped}$`));
+    } catch {
+      if (!seenBad.has(pat)) {
+        console.error(`[context-ledger:classify] ignoring invalid editor_backup_pattern: ${pat}`);
+        seenBad.add(pat);
       }
     }
-
-    // 2. scope_aliases — scan active decisions (mirror scope.ts:65–73)
-    for (const folded of state.decisions.values()) {
-      if (folded.state !== "active") continue;
-      if (folded.record.scope.type !== scope.type || folded.record.scope.id !== scope.id) continue;
-      for (const alias of folded.record.scope_aliases) {
-        if (n.startsWith(normalizePath(alias))) return true;
-      }
-    }
-
-    // 3. Directory fallback (mirror scope.ts:76–89)
-    const segments = n.split("/");
-    const srcIdx = segments.indexOf("src");
-    const segment = srcIdx >= 0 && srcIdx + 1 < segments.length ? segments[srcIdx + 1] : segments[0];
-    if (segment === scope.id) return true;
   }
+  return compiled;
+}
+
+// Filename-segment-only match. Normalize backslashes so Windows-shaped inputs (unlikely from
+// git diff-tree, but possible from other call sites or test fixtures) still work.
+function isEditorBackup(filepath: string, compiledPatterns: RegExp[]): boolean {
+  const normalized = filepath.replace(/\\/g, "/");
+  const filename = normalized.split("/").pop() ?? normalized;
+  if (filename.length === 0) return false; // e.g. "foo/" — directory marker, not a file
+  for (const rx of compiledPatterns) if (rx.test(filename)) return true;
   return false;
 }
 ```
 
-Update the call sites in 3.3 to pass `state` (the `MaterializedState` from `foldLedger`) into `inboxItemIntersectsScope`.
+### 3b. Extend the file-deletion filter
 
-**On durability filtering for rejected inbox items (Bucket 1 fix 1.6):** rejected inbox items are NOT filtered by durability because durability is a `DecisionRecord` field, not an `InboxItem` field. `include_feature_local` only affects the decision filter in query.ts:72–78.
-
-### 3.3 Extend `queryDecisions` to read and filter dismissed inbox items
-
-Inside `queryDecisions`, after the existing `pendingInbox` block (around query.ts:140–150), add:
+Find the block at lines 313-322 that emits `file-deletion`:
 
 ```ts
-  // Read dismissed inbox items with rejection_reason for mistakes_in_scope.
-  // Scope-intersection is required; when scope is null (recency fallback), omit entirely.
-  // User triage Q4: recency fallback (derivedScope === null) includes the N=10
-  // most recent dismissed inbox items with rejection_reason, sorted by rejected_at desc.
-  // This honors the "apply to every scope-derivation path" instruction.
-  const RECENCY_FALLBACK_REJECTED_INBOX_CAP = 10;
-
-  const rejectedInboxItems = derivedScope
-    ? allInbox.filter(
-        (item) =>
-          item.status === "dismissed" &&
-          typeof item.rejection_reason === "string" &&
-          item.rejection_reason.length > 0 &&
-          inboxItemIntersectsScope(item, derivedScope, state, config),
-      )
-    : allInbox
-        .filter(
-          (item) =>
-            item.status === "dismissed" &&
-            typeof item.rejection_reason === "string" &&
-            item.rejection_reason.length > 0,
-        )
-        .sort((a, b) => {
-          const aTime = a.last_prompted_at ?? a.created;
-          const bTime = b.last_prompted_at ?? b.created;
-          return bTime.localeCompare(aTime);
-        })
-        .slice(0, RECENCY_FALLBACK_REJECTED_INBOX_CAP);
-```
-
-### 3.4 Update the `buildDecisionPack` call site (query.ts:153)
-
-```ts
-  return buildDecisionPack(filtered, derivedScope, pendingInbox, rejectedInboxItems, params, config);
-```
-
-### Phase 3 Validation Gate
-
-```bash
-npm run build 2>&1 | tee /tmp/ctx-build-p3.log
-grep -c "error TS" /tmp/ctx-build-p3.log || echo "0 errors"
-grep -n "rejectedInboxItems\|inboxItemIntersectsScope\|include_feature_local" src/retrieval/query.ts
-git diff --stat src/capture/ | wc -l
-git diff --stat src/ledger/storage.ts | wc -l
-```
-
-**Expected:**
-- Zero TS errors across the whole project.
-- `rejectedInboxItems` threading visible.
-- `src/capture/` untouched. `src/ledger/storage.ts` untouched (no new writes).
-
-**STOP AND REPORT** — show grep output proving the filter flag and rejected-inbox flow are wired. Commit: `feat(retrieval-mistakes): phase 3 — query orchestration + include_feature_local`.
-
----
-
-## Phase 4 — Trim-Order Rewrite (Option A — spec-literal, user-locked)
-
-**Goal:** rewrite the trim block so `mistakes_in_scope` is the last casualty under token pressure. User explicitly locked Option A in triage.
-
-### 4.1 Option A trim sequence
-
-Replace the current trim block in `src/retrieval/packs.ts:130–157` with:
-
-```ts
-  // ── Token budgeting ────────────────────────────────────────────────────────
-  //
-  // Trim priority (first to drop → last to drop), locked by user triage (spec-literal):
-  //   1. active_precedents  (from tail — lowest effective_rank_score first)
-  //   2. recently_superseded  (drop entirely)
-  //   3. abandoned_approaches  (drop entirely)
-  //   4. pending_inbox_items  (cap via inbox_max_items_per_session, then pop from tail)
-  //   5. mistakes_in_scope  ← LAST casualty; antipatterns are the highest-signal-per-token
-  //      data for preventing repeats. Dropped only if every peer bucket is empty.
-  //
-  // Within mistakes_in_scope: pop from tail (least-recent per sort order).
-  // `truncated: true` is set once on entering this block; never reset to false.
-
-  const budget = config.retrieval.token_budget;
-  pack.token_estimate = estimateTokens(pack);
-
-  if (pack.token_estimate > budget) {
-    pack.truncated = true;
-
-    // 1. active_precedents — pop from tail (already sorted descending by retrieval_weight).
-    while (pack.token_estimate > budget && pack.active_precedents.length > 0) {
-      pack.active_precedents.pop();
-      pack.token_estimate = estimateTokens(pack);
-    }
-
-    // 2. recently_superseded — drop entirely.
-    if (pack.token_estimate > budget && pack.recently_superseded.length > 0) {
-      pack.recently_superseded = [];
-      pack.token_estimate = estimateTokens(pack);
-    }
-
-    // 3. abandoned_approaches — drop entirely.
-    if (pack.token_estimate > budget && pack.abandoned_approaches.length > 0) {
-      pack.abandoned_approaches = [];
-      pack.token_estimate = estimateTokens(pack);
-    }
-
-    // 4. pending_inbox_items — cap first, then pop from tail.
-    if (pack.token_estimate > budget && pack.pending_inbox_items.length > 0) {
-      const cap = config.capture.inbox_max_items_per_session;
-      if (pack.pending_inbox_items.length > cap) {
-        pack.pending_inbox_items = pack.pending_inbox_items.slice(0, cap);
-        pack.token_estimate = estimateTokens(pack);
-      }
-      while (pack.token_estimate > budget && pack.pending_inbox_items.length > 0) {
-        pack.pending_inbox_items.pop();
-        pack.token_estimate = estimateTokens(pack);
-      }
-    }
-
-    // 5. mistakes_in_scope — last resort. Pop from tail.
-    while (pack.token_estimate > budget && pack.mistakes_in_scope.length > 0) {
-      pack.mistakes_in_scope.pop();
-      pack.token_estimate = estimateTokens(pack);
-    }
-
-    console.error(
-      `context-ledger: decision pack trimmed to ${budget} token budget (truncated: true)`,
-    );
-  }
-```
-
-### 4.2 Behavior check
-
-Under heavy token pressure on a hot scope, an over-budget pack can return zero `active_precedents` but a full `mistakes_in_scope` — this is the intentional "antipatterns > active precedents under token pressure" bet. If `mistakes_in_scope` is itself large enough to exceed the budget, it is trimmed from the tail (least recent first, per the Phase 2 sort order).
-
-### Phase 4 Validation Gate
-
-```bash
-npm run build 2>&1 | tee /tmp/ctx-build-p4.log
-grep -c "error TS" /tmp/ctx-build-p4.log || echo "0 errors"
-grep -nA2 "Trim priority" src/retrieval/packs.ts
-git diff --stat src/capture/ | wc -l
-```
-
-**Expected:** zero errors, new trim block visible with comment, hook untouched.
-
-**STOP AND REPORT** — print the trim block and confirm which option was applied. Commit: `feat(retrieval-mistakes): phase 4 — trim order protects mistakes_in_scope`.
-
----
-
-## Phase 5 — CLI Rendering (Q3 Replace — user-locked)
-
-**Goal:** swap `searchDecisions` for `queryDecisions` in the CLI `query` handler and render the full decision pack. The CLI becomes a faithful debugging mirror of what the agent sees over MCP.
-
-### 5.1 Replace `handleQuery` in `src/cli.ts`
-
-Locate `handleQuery` at lines 133–162. Merge the retrieval import so the file imports `queryDecisions` and drops `searchDecisions` (unless another caller still needs it — grep first):
-
-```bash
-grep -n "searchDecisions" src/cli.ts
-grep -rn "searchDecisions" src/ | grep -v "src/retrieval/"
-```
-
-If `searchDecisions` has no other consumers, remove it from the retrieval barrel and the import. Otherwise, just drop the CLI import.
-
-Updated import (merge into existing line):
-
-```ts
-import { queryDecisions } from "./retrieval/index.js";
-```
-
-Replace the entire `handleQuery` body with a full-pack renderer:
-
-```ts
-async function handleQuery(queryText: string, projectRoot: string): Promise<void> {
-  const pack = await queryDecisions({ query: queryText }, projectRoot);
-
-  // Section 1 — Prior mistakes in this scope (rendered FIRST per spec).
-  if (pack.mistakes_in_scope.length > 0) {
-    console.log(`\nPrior mistakes in this scope (${pack.mistakes_in_scope.length}):\n`);
-    for (const m of pack.mistakes_in_scope) {
-      switch (m.kind) {
-        case "superseded_with_pain_points":
-          console.log(`  [superseded] ${m.record.id}  → replaced_by ${m.replaced_by}`);
-          console.log(`    ${m.record.summary}`);
-          for (const pp of m.pain_points) console.log(`    pain: ${pp}`);
-          break;
-        case "abandoned":
-          console.log(`  [abandoned]  ${m.record.id}`);
-          console.log(`    ${m.record.summary}`);
-          if (m.reason) console.log(`    reason: ${m.reason}`);
-          for (const pp of m.pain_points) console.log(`    pain: ${pp}`);
-          break;
-        case "rejected_inbox_item":
-          console.log(`  [rejected]   ${m.inbox_id}  ${m.commit_sha.slice(0, 7)}`);
-          console.log(`    ${m.commit_message}`);
-          console.log(`    rejection: ${m.rejection_reason}`);
-          break;
-        default: {
-          const _exhaustive: never = m;
-          throw new Error(`Unhandled MistakeEntry kind: ${JSON.stringify(_exhaustive)}`);
-        }
-      }
-    }
-  }
-
-  // Section 2 — Active precedents.
-  if (pack.active_precedents.length > 0) {
-    console.log(`\nActive precedents (${pack.active_precedents.length}):\n`);
-    for (const p of pack.active_precedents) {
-      const flags: string[] = [p.match_reason];
-      if (p.review_overdue) flags.push("review_overdue");
-      console.log(`  [active]     ${p.record.id}  weight=${p.retrieval_weight.toFixed(2)}  ${flags.join(" ")}`);
-      console.log(`    ${p.record.summary}`);
-      console.log(`    scope: ${p.record.scope.type}/${p.record.scope.id}  kind: ${p.record.decision_kind}  durability: ${p.record.durability}`);
-    }
-  }
-
-  // Section 3 — Abandoned approaches (legacy bucket; may overlap with mistakes).
-  if (pack.abandoned_approaches.length > 0) {
-    console.log(`\nAbandoned approaches (${pack.abandoned_approaches.length}):\n`);
-    for (const a of pack.abandoned_approaches) {
-      console.log(`  [abandoned]  ${a.record.id}  ${a.match_reason}`);
-      console.log(`    ${a.record.summary}`);
-      for (const pp of a.pain_points) console.log(`    pain: ${pp}`);
-    }
-  }
-
-  // Section 4 — Recently superseded (only populated with include_superseded=true).
-  if (pack.recently_superseded.length > 0) {
-    console.log(`\nRecently superseded (${pack.recently_superseded.length}):\n`);
-    for (const s of pack.recently_superseded) {
-      console.log(`  [superseded] ${s.record.id}  → ${s.replaced_by}`);
-      console.log(`    ${s.record.summary}`);
-    }
-  }
-
-  // Section 5 — Pending inbox items.
-  if (pack.pending_inbox_items.length > 0) {
-    console.log(`\nPending inbox items (${pack.pending_inbox_items.length}):\n`);
-    for (const i of pack.pending_inbox_items) {
-      console.log(`  [${i.type}] ${i.inbox_id}  ${i.commit_sha.slice(0, 7)}  ${i.change_category}`);
-      console.log(`    ${i.commit_message}`);
-    }
-  }
-
-  // Footer.
-  const derived = pack.derived_scope
-    ? `${pack.derived_scope.type}/${pack.derived_scope.id} (source: ${pack.derived_scope.source})`
-    : "null (recency fallback)";
-  console.log(`\n— derived_scope: ${derived}`);
-  console.log(`— token_estimate: ${pack.token_estimate}${pack.truncated ? "  (truncated)" : ""}`);
-  if (pack.no_precedent_scopes.length > 0) {
-    console.log(`— no_precedent_scopes: ${pack.no_precedent_scopes.join(", ")}`);
-  }
-
-  const empty =
-    pack.mistakes_in_scope.length === 0 &&
-    pack.active_precedents.length === 0 &&
-    pack.abandoned_approaches.length === 0 &&
-    pack.recently_superseded.length === 0 &&
-    pack.pending_inbox_items.length === 0;
-  if (empty) console.log("\nNo matching decisions found.");
+// File deletion (non-test, non-doc, not already caught by Tier 2)
+const unclaimed = del.filter((f) => !claimedFiles.has(f) && !isTestFile(f) && !isDocFile(f));
+if (unclaimed.length > 0) {
+  results.push({
+    tier: 1,
+    change_category: "file-deletion",
+    inbox_type: "draft_needed",
+    changed_files: dedup(unclaimed),
+  });
 }
 ```
 
-### 5.2 Cleanup: remove `searchDecisions` if unused
+Replace with:
 
-If the earlier grep showed zero other consumers of `searchDecisions`, remove it:
-- Delete the function from `src/retrieval/query.ts` (lines 158–194).
-- Remove from the barrel re-export in `src/retrieval/index.ts`.
-- Verify the `SearchResult` interface has no other consumers; delete if orphaned.
-
-Otherwise, leave it in place — only the CLI import changes.
-
-### Phase 5 Validation Gate
-
-```bash
-npm run build 2>&1 | tee /tmp/ctx-build-p5.log
-grep -c "error TS" /tmp/ctx-build-p5.log || echo "0 errors"
-grep -n "queryDecisions\|Prior mistakes\|Active precedents" src/cli.ts
-# Confirm retrieval import appears exactly once:
-grep -c "^import.*from \"./retrieval/index.js\"" src/cli.ts
-# Confirm searchDecisions is gone from cli.ts (it should NOT appear):
-grep -c "searchDecisions" src/cli.ts || echo "0 (good)"
+```ts
+// File deletion (non-test, non-doc, non-editor-backup, not already caught by Tier 2)
+const backupPatterns = compileBackupPatterns(
+  config.capture.classifier?.editor_backup_patterns ?? DEFAULT_BACKUP_PATTERNS,
+);
+const unclaimed = del.filter(
+  (f) =>
+    !claimedFiles.has(f) &&
+    !isTestFile(f) &&
+    !isDocFile(f) &&
+    !isEditorBackup(f, backupPatterns),
+);
+if (unclaimed.length > 0) {
+  results.push({
+    tier: 1,
+    change_category: "file-deletion",
+    inbox_type: "draft_needed",
+    changed_files: dedup(unclaimed),
+  });
+}
 ```
 
-**Expected:** zero TS errors, full-pack rendering code visible, retrieval import appears exactly once, `searchDecisions` absent from `src/cli.ts`.
+**Why `?? DEFAULT_BACKUP_PATTERNS`:** existing hook.test.ts tests construct a minimal config that doesn't include the new `classifier` key. The optional-chain + default fallback keeps those tests green without touching their fixtures while still honoring user overrides in real configs.
 
-**STOP AND REPORT** — show the grep output. Commit: `feat(retrieval-mistakes): phase 5 — CLI renders full decision pack`.
+**Why compile once per invocation:** regex construction inside `del.filter`'s callback would recompile patterns O(files × patterns) times per classify pass — avoidable hook overhead. Hoisting the `compileBackupPatterns` call above the filter keeps the common case at O(patterns + files).
+
+**Glob semantic contract:** patterns match the filename segment only. `vendor/**/*.bak` would match `*.bak` at any depth but the `vendor/**/` prefix is ignored. This is filename-segment-only by design — document this in the CHANGELOG and in the spec update. If a future patch needs path-prefix matching, extend the API then.
+
+**Scope of suppression:** narrow to the Tier 1 `file-deletion` classifier only. Tier 2 detectors (module replacement, feature removal, auth-security-change) that read the `deleted` list are NOT affected by this patch — a future patch can unify the suppression if dogfood reveals noise there. Document this narrowness in the Phase 3 STOP AND REPORT.
+
+### Validation gate — Phase 3
+
+```bash
+npx tsc --noEmit 2>&1 | grep "src/capture/classify.ts"
+grep -n "isEditorBackup\|DEFAULT_BACKUP_PATTERNS" src/capture/classify.ts
+```
+
+Expected:
+- Zero TS errors in `classify.ts`.
+- Helper and constant both present.
+
+### STOP AND REPORT — end of Phase 3
+
+Report: filter change made, helper added, classify.ts typechecks cleanly.
 
 ---
 
-## Phase 6 — Write-Tools Cleanup + MCP Tool Description
+## Phase 4: Hook drafter — payload rename + scope population (Bugs 7 + 8)
 
-**Goal:** remove the dynamic `rejection_reason` cast (now that the field is typed) and update the `query_decisions` tool description.
+**Goal:** hook drafter emits `proposed_record` (not `proposed_decision`) and populates scope fields on the drafted payload.
 
-### 6.1 Replace the dynamic cast in `src/mcp/write-tools.ts:258–262`
+**File:** `src/capture/hook.ts`.
+
+### 4a. Update `buildInboxItem` signature and body (lines 36-61)
 
 ```ts
-        const updatedItems = inboxItems.map((i) => {
-          if (i.inbox_id === args.inbox_id) {
-            return {
-              ...i,
-              status: "dismissed" as const,
-              client_operation_id: args.client_operation_id,
-              ...(args.reason ? { rejection_reason: args.reason } : {}),
-            } as PersistedInboxItem;
+function buildInboxItem(
+  result: ClassifyResult,
+  sha: string,
+  redactedMessage: string,
+  diffSummary: string,
+  config: LedgerConfig,
+  proposedDecision?: ProposedDecisionDraft,
+  derivedScope?: DerivedScope | null,   // v1.2.1 — scope-field population (Bug 8)
+): InboxItem {
+  const item: InboxItem = {
+    inbox_id: generateInboxId(),
+    type: result.inbox_type,
+    created: new Date().toISOString(),
+    commit_sha: sha,
+    commit_message: redactedMessage,
+    change_category: result.change_category,
+    changed_files: [...result.changed_files].sort(),
+    diff_summary: diffSummary,
+    priority: "normal",
+    expires_after: new Date(
+      Date.now() + config.capture.inbox_ttl_days * 24 * 60 * 60 * 1000,
+    ).toISOString(),
+    times_shown: 0,
+    last_prompted_at: null,
+    status: "pending",
+  };
+  if (proposedDecision) {
+    // v1.2.1 — enrich draft with scope fields (Bug 8) and emit under canonical key (Bug 7).
+    const enriched: ProposedDecisionDraft = {
+      ...proposedDecision,
+      ...(derivedScope
+        ? {
+            scope_type: derivedScope.type,
+            scope_id: derivedScope.id,
           }
-          return i;
-        });
+        : {}),
+      affected_files: [...result.changed_files].sort(),
+      scope_aliases: [],
+    };
+    item.proposed_record = enriched;
+  }
+  return item;
+}
 ```
 
-### 6.2 Update the `query_decisions` tool description in `src/mcp/read-tools.ts:11`
+Imports to merge — `DerivedScope` type from `../retrieval/index.js`. Inspect the existing import line for `deriveScope` and merge the type alongside it:
 
 ```ts
-    "Retrieve relevant decision records for a file path, query, or scope. Returns a decision pack with prior mistakes in scope (antipatterns surfaced first), active precedents, abandoned approaches, recently superseded decisions, and pending inbox items.",
+import { deriveScope, type DerivedScope } from "../retrieval/index.js";
 ```
 
-**MCP annotations — unchanged (Bucket 1 fix 1.7).** The annotations block at `src/mcp/read-tools.ts:24` MUST remain `{ readOnlyHint: true, destructiveHint: false, openWorldHint: false }`. Verify with:
+### 4b. Thread `derivedScope` into the `buildInboxItem` call
+
+The drafter block at line 372 already computes `const derived = deriveScope(...)` when drafting is enabled. To make scope available for every result (not just drafted ones, and for Bug 8 even when the drafter is skipped), hoist the `deriveScope` computation to the top of the per-result loop.
+
+**Inside the `for (const result of results)` loop (starting ~line 353), just before the `if (result.inbox_type === "draft_needed" && drafterEnabled)` block**, add:
+
+```ts
+    const perResultDerived = deriveScope(
+      { file_path: result.changed_files[0] },
+      config,
+      foldedState?.decisions ?? new Map(),
+    );
+```
+
+Replace the existing `const derived = deriveScope(...)` call inside the drafter block (line 372) with a reference to `perResultDerived`. Example:
+
+```ts
+        } else {
+          // const derived = deriveScope(  <-- REMOVE this block
+          //   { file_path: result.changed_files[0] },
+          //   config,
+          //   foldedState?.decisions ?? new Map(),
+          // );
+          const precedents = precedentsForScope(
+            foldedState?.decisions ?? new Map(),
+            perResultDerived,      // <-- use the hoisted value
+          );
+          // ... rest unchanged
+        }
+```
+
+Pass `perResultDerived` as the 7th argument to `buildInboxItem` at line 400:
+
+```ts
+const item = buildInboxItem(
+  result,
+  sha,
+  redactedMessage,
+  redactedSummary,
+  config,
+  proposed,
+  perResultDerived,
+);
+```
+
+**Cost audit:** `deriveScope` is pure CPU — dictionary lookup + longest-prefix-match against `scope_mappings`. Hoisting it outside the drafter gate adds zero I/O and effectively zero CPU. Well under 100ms.
+
+### 4c. Confirm no lingering write to `item.proposed_decision`
 
 ```bash
-grep -nA1 "readOnlyHint: true" src/mcp/read-tools.ts
+grep -n "item.proposed_decision" src/capture/hook.ts
 ```
 
-**Expected:** the line `readOnlyHint: true, destructiveHint: false, openWorldHint: false` is byte-identical to pre-feature.
+Expected: zero hits.
 
-### Phase 6 Validation Gate
+### Validation gate — Phase 4
 
 ```bash
-npm run build 2>&1 | tee /tmp/ctx-build-p6.log
-grep -c "error TS" /tmp/ctx-build-p6.log || echo "0 errors"
-grep -n "as unknown as Record" src/mcp/write-tools.ts
-grep -n "prior mistakes\|Prior mistakes" src/mcp/read-tools.ts
+npx tsc --noEmit 2>&1 | grep "src/capture/hook.ts"
+grep -c "item.proposed_decision" src/capture/hook.ts   # expect 0
+grep -c "item.proposed_record" src/capture/hook.ts     # expect 1
+grep -n "perResultDerived" src/capture/hook.ts
 ```
 
-**Expected:**
-- Zero TS errors.
-- The `as unknown as Record` cast line is gone.
-- Tool description mentions prior mistakes.
+Expected:
+- Zero TS errors in hook.ts.
+- Exactly one `item.proposed_record` write.
+- Zero `item.proposed_decision` assignments.
+- `perResultDerived` computed once per result and threaded into `buildInboxItem`.
 
-**STOP AND REPORT** — confirm cast removal. Commit: `feat(retrieval-mistakes): phase 6 — typed rejection_reason + tool description`.
+### STOP AND REPORT — end of Phase 4
+
+Report: `buildInboxItem` rewritten; rename complete; scope fields populated; `perResultDerived` threaded; hook.ts typechecks cleanly (test file will still error — expected, addressed in Phase 7).
 
 ---
 
-## Phase 7 — Smoke Tests
+## Phase 5: Same-day revert suppression (Bug 9)
 
-**Goal:** all 5 acceptance tests in `src/retrieval/smoke-test.ts` plus one end-to-end in `src/smoke.ts`. Follow the `makeDecision`/`makeTransition`/`appendToLedger` pattern from existing tests.
+**Goal:** hook drafter emits zero inbox items for both halves of a feat+revert pair inside a configurable window (default 24h). Note: "both halves" is bounded by commit timing — see the semantics note below.
 
-### 7.1 Five targeted tests in `src/retrieval/smoke-test.ts`
+**File:** `src/capture/hook.ts`.
 
-Add these at the bottom of the test list (follow existing `testN_...` naming, increment indices):
+### 5a. Add `isRevertSuppressed` helper
 
-**Test A — superseded with pain_points:**
-Seed one active decision (`precedent`, `confirmed_draft`) scoped to `domain/retrieval`. Seed another superseded decision in the same scope with a `supersede` transition containing `pain_points: ["leaked sessions"]`. Also seed the replacement decision referenced by `replaced_by`. Query by `scope_type: "domain"`, `scope_id: "retrieval"`. Assert:
-- `pack.active_precedents.length === 1`
-- `pack.mistakes_in_scope.length === 1`
-- `pack.mistakes_in_scope[0].kind === "superseded_with_pain_points"`
-- `(pack.mistakes_in_scope[0] as any).pain_points.includes("leaked sessions")`
+Place near the top of the file with other helpers (above `postCommit`). Use **`execFileSync`** (NOT `execSync`) so the `%H`/`%s`/`%ct`/`%b` format tokens pass through as-is on Windows — on cmd.exe, a shell-interpolated `execSync` would let `%H` expand before git sees it. Match the style of `getCommitDiff` at hook.ts:74-82 which already uses `execFileSync`.
 
-**Test B — commit_inferred exclusion:**
-Seed two abandoned decisions in scope `domain/retrieval`: one with `evidence_type: "backfill_confirmed"`, one with `evidence_type: "commit_inferred"`. Both have abandon transitions. Query. Assert:
-- `pack.mistakes_in_scope.length === 1`
-- the surviving entry is `kind: "abandoned"` and its `record.evidence_type === "backfill_confirmed"`.
-
-**Test C — rejected inbox item intersects scope:**
-Seed one active decision in scope `domain/retrieval` with a config `scope_mappings: {"src/retrieval/": {type: "domain", id: "retrieval"}}`. Write one dismissed inbox item to `inbox.jsonl` with `status: "dismissed"`, `rejection_reason: "out of scope for this release"`, `changed_files: ["src/retrieval/packs.ts"]`. Query by `file_path: "src/retrieval/packs.ts"`. Assert:
-- `pack.mistakes_in_scope.length === 1`
-- `pack.mistakes_in_scope[0].kind === "rejected_inbox_item"`
-- `(pack.mistakes_in_scope[0] as any).rejection_reason === "out of scope for this release"`
-
-**Test D — forced trim, Option A (active goes first, mistakes last):**
-Seed many active decisions (e.g. 30 long-description ones) and 2 abandoned decisions with `pain_points`, all in scope `domain/retrieval`. Set `config.retrieval.token_budget = 800`. Query. Assert:
-- `pack.truncated === true`
-- `pack.mistakes_in_scope.length === 2` (survived as last casualty)
-- `pack.active_precedents.length === 0` (fully trimmed — spec-literal Option A)
-- `pack.abandoned_approaches.length === 0` (dropped entirely)
-
-**Test E — feature_hint_mappings path populates mistakes:**
-Write config with `feature_hint_mappings: { auth: ["auth"] }`. Seed an abandoned decision in scope `domain/auth` with pain_points. Query with `query: "how do we handle auth"` (no file_path, no scope_type). Assert:
-- `pack.derived_scope?.id === "auth"`
-- `pack.mistakes_in_scope.length === 1`
-- `pack.mistakes_in_scope[0].kind === "abandoned"`
-
-**Test H — recency fallback includes capped rejected inbox items (Q4):**
-Seed 12 dismissed inbox items with `rejection_reason` and varied `rejected_at` timestamps. Do NOT seed any decisions. Query with NO `file_path`, NO `scope_type`, NO `query` (forces `derivedScope === null`). Assert:
-- `pack.derived_scope === null`
-- `pack.mistakes_in_scope.length === 10` (capped)
-- All 10 entries have `kind === "rejected_inbox_item"`
-- Sorted by `rejected_at` desc (verify first entry is the most recent)
-
-### 7.2 Runner update
-
-The existing runner at the bottom of `src/retrieval/smoke-test.ts` invokes each test in sequence. Add the new test calls (Tests A, B, C, D, E, F, G, H) there. Update the `dirs` accumulator pattern.
-
-### 7.3 End-to-end test in `src/smoke.ts`
-
-Add one test after the existing ones: seed a ledger with one abandoned decision, run `queryDecisions`, assert `pack.mistakes_in_scope.length === 1`. This protects the MCP → query → pack wiring.
-
-### 7.4 Test F — Zero-Write Contract (Bucket 1 fix 1.10)
-
-In `src/retrieval/smoke-test.ts`, add:
+Revert detection keys off the commit **body**, not the subject. Subjects vary (`--no-edit` default, manual rewrites, cherry-picked reverts) but `git revert` always writes `This reverts commit <40-char-sha>.` to the body. The full 40-char SHA is used — no abbreviated-SHA fuzzy matching, which would allow 7-char collisions to suppress the wrong draft.
 
 ```ts
-async function testF_zeroWriteContract(tmpDir: string): Promise<void> {
-  console.error("\nTest F: queryDecisions writes nothing to disk");
-  await writeConfig(tmpDir, {
-    capture: { scope_mappings: {}, redact_patterns: [] },
-    retrieval: { token_budget: 4000 },
-  });
+// v1.2.1 Bug 9 — same-day revert suppression.
+// Returns true if the current commit is reverted by a within-window commit,
+// OR the current commit is a Revert of a within-window commit.
+// Fails open (returns false) on any git error — drafting proceeds normally.
+function isRevertSuppressed(
+  projectRoot: string,
+  sha: string,
+  fullBody: string,
+  windowHours: number,
+): boolean {
+  let raw: string;
+  try {
+    raw = execFileSync(
+      "git",
+      ["log", "-n", "20", "--format=%H%x00%ct%x00%b%x1e"],
+      { cwd: projectRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+  } catch {
+    return false;
+  }
 
-  const d1 = makeDecision({
-    id: generateDecisionId(),
-    evidence_type: "human_answered",
-    durability: "precedent",
-    scope: { type: "domain", id: "retrieval" },
-  });
-  await appendToLedger(d1, tmpDir);
-  const t1 = makeTransition({ target_id: d1.id, action: "abandon", reason: "tried, failed", pain_points: ["oom"] });
-  await appendToLedger(t1, tmpDir);
+  interface LogEntry {
+    sha: string;    // full 40-char SHA from %H
+    ct: number;     // committer unix timestamp from %ct — cherry-picks keep a current ct; author date would not
+    body: string;
+  }
+  const entries: LogEntry[] = [];
+  for (const rec of raw.split("\x1e").map((r) => r.trim()).filter(Boolean)) {
+    const parts = rec.split("\x00");
+    if (parts.length < 3) continue;
+    const ct = Number(parts[1]);
+    if (!Number.isFinite(ct)) continue;
+    entries.push({ sha: parts[0], ct, body: parts[2] ?? "" });
+  }
+  if (entries.length === 0) return false;
 
-  const ledgerPath = join(tmpDir, ".context-ledger", "ledger.jsonl");
-  const inboxPath = join(tmpDir, ".context-ledger", "inbox.jsonl");
+  const current = entries.find((e) => e.sha === sha);
+  if (!current) return false;
+  const windowSeconds = windowHours * 3600;
 
-  const ledgerBefore = await readFile(ledgerPath);
-  let inboxBefore: Buffer | null = null;
-  try { inboxBefore = await readFile(inboxPath); } catch { /* inbox may not exist yet */ }
+  // Case A: the current commit is reverted by a later commit within window.
+  // Key off body content (not subject) — reliable across --no-edit, manual, cherry-picked reverts.
+  for (const other of entries) {
+    if (other.sha === sha) continue;
+    if (!other.body.includes(`This reverts commit ${sha}`)) continue;
+    if (Math.abs(other.ct - current.ct) <= windowSeconds) return true;
+  }
 
-  await queryDecisions({ scope_type: "domain", scope_id: "retrieval" }, tmpDir);
+  // Case B: the current commit is itself a Revert of an earlier commit within window.
+  // Require full 40-char SHA — abbreviated matches risk 7-char collisions on moderate repos.
+  const revertMatch = fullBody.match(/This reverts commit ([0-9a-f]{40})\b/);
+  if (revertMatch) {
+    const targetSha = revertMatch[1];
+    const target = entries.find((e) => e.sha === targetSha);
+    if (target && Math.abs(current.ct - target.ct) <= windowSeconds) return true;
+  }
 
-  const ledgerAfter = await readFile(ledgerPath);
-  assert(ledgerBefore.equals(ledgerAfter), "ledger.jsonl unchanged after queryDecisions");
+  return false;
+}
+```
 
-  if (inboxBefore) {
-    const inboxAfter = await readFile(inboxPath);
-    assert(inboxBefore.equals(inboxAfter), "inbox.jsonl unchanged after queryDecisions");
+**Import note:** `execFileSync` must be imported in hook.ts from `node:child_process`. The file already imports `execSync` from that module — merge the import (do NOT add a second line):
+
+```ts
+// Merge — not add — into the existing node:child_process import line
+import { execSync, execFileSync } from "node:child_process";
+```
+
+### 5b. Call `isRevertSuppressed` in `postCommit`
+
+Insert immediately after the merge-commit check (~line 267) and BEFORE the `git diff-tree` call and classification (line 272+):
+
+```ts
+    // 5. Skip merge commits
+    if (isMergeCommit(projectRoot)) {
+      debug("merge commit, skipping");
+      return;
+    }
+
+    // 5b. v1.2.1 Bug 9 — skip if this commit is part of a same-day feat+revert pair.
+    const revertWindowHours = config.capture.drafter.revert_suppression_window_hours ?? 24;
+    if (isRevertSuppressed(projectRoot, sha, fullBody, revertWindowHours)) {
+      debug("same-day revert pair, skipping draft");
+      return;
+    }
+```
+
+Rationale for placement: after merge-commit guard (cheapest early exit) and before the more expensive `git diff-tree` / classifier work. Keeps the 100ms budget slack.
+
+### 5c. Timing semantics — important
+
+The hook runs synchronously at each commit's post-commit moment. When the **feat** commit fires the hook, the revert doesn't exist yet — so the feat gets drafted and appended to inbox. Only when the **revert** commit's hook fires can it detect the revert-of-feat relationship and suppress the draft for the revert itself.
+
+This is the correct v1.2.1 behavior: the suppression prevents the revert from doubling the inbox (turning 1 draft into 2). Retroactively removing the feat's draft would require rewriting `inbox.jsonl`, which violates append-only. **Document this in the CHANGELOG**: the suppression halves the noise, not eliminates it, when the revert follows the feat. Users can manually reject the feat's draft if they see both land.
+
+### 5d. Fail-open behavior
+
+The `try/catch` in the helper swallows any git error. The outer `postCommit` try/catch at line 406 catches unexpected errors and logs. No timeout option is set on `execSync`, matching existing shellout style in the file.
+
+### Validation gate — Phase 5
+
+```bash
+npx tsc --noEmit 2>&1 | grep "src/capture/hook.ts"
+grep -n "isRevertSuppressed" src/capture/hook.ts
+grep -n "revert_suppression_window_hours" src/capture/hook.ts
+```
+
+Expected:
+- Zero TS errors in hook.ts.
+- `isRevertSuppressed` defined and called.
+- The config field read at the call site.
+
+### STOP AND REPORT — end of Phase 5
+
+Report: helper added; called after merge-commit check; fail-open on git errors; window default 24h honored; hook.ts still typechecks.
+
+---
+
+## Phase 6: Read-side fallback (Bug 7 legacy support)
+
+**Goal:** `confirm_pending` reads `proposed_record` first, falls back to legacy `proposed_decision`, and safely constructs a `DecisionRecord` even when the legacy payload lacks scope fields.
+
+**File:** `src/mcp/write-tools.ts`.
+
+### 6a. Update `confirm_pending` reader (around line 186)
+
+Find:
+```ts
+        const proposed = item.proposed_record;
+        if (!proposed) {
+          return makeToolError("Inbox item has no proposed record data");
+        }
+```
+
+Replace with:
+```ts
+        // v1.2.1 Bug 7 — accept legacy proposed_decision key.
+        const proposed =
+          item.proposed_record ??
+          ((item as unknown as { proposed_decision?: ProposedRecord }).proposed_decision);
+        if (!proposed) {
+          return makeToolError("Inbox item has no proposed record data");
+        }
+```
+
+### 6b. Legacy-item scope fallback — use `deriveScope`, NOT a sentinel
+
+Legacy `proposed_decision` payloads (pre-Bug-8) lack scope_type, scope_id, affected_files, scope_aliases, revisit_conditions, review_after. The `DecisionRecord` spec requires all of these.
+
+**Do NOT hard-code `scope.id = "unknown"`.** Writing a durable DecisionRecord into a sentinel scope pollutes retrieval — every legacy-confirmed record lands in the same junk bucket, queries group unrelated decisions, and auto-promotion never matches correctly. Instead: call `deriveScope` on the legacy item's `changed_files`. If that returns null, fall back to a **real** directory scope derived from the path, not a sentinel.
+
+Import `deriveScope` into write-tools.ts — merge into an existing `../retrieval/...` import if one exists, otherwise add it carefully:
+
+```ts
+import { deriveScope } from "../retrieval/index.js";
+```
+
+Add a helper near the top of write-tools.ts (below the `PersistedInboxItem` type declaration):
+
+```ts
+// v1.2.1 Bug 7 — derive a real scope for legacy inbox items that lack scope fields.
+// Returns DerivedScope shape. Falls back to the first changed_file's top-level directory;
+// last resort is the single-segment "root" bucket. NEVER returns a literal "unknown" sentinel.
+function deriveLegacyScope(
+  item: InboxItem,
+  config: LedgerConfig,
+): { type: ScopeType; id: string } {
+  const firstFile = item.changed_files[0];
+  if (firstFile) {
+    const derived = deriveScope({ file_path: firstFile }, config, new Map());
+    if (derived) return { type: derived.type, id: derived.id };
+    // deriveScope returned null — fall back to the top-level directory segment.
+    const normalized = firstFile.replace(/\\/g, "/");
+    const top = normalized.split("/")[0] ?? "root";
+    return { type: "directory", id: top || "root" };
+  }
+  return { type: "directory", id: "root" };
+}
+```
+
+Find the DecisionRecord construction block (around lines 196-225). Update the relevant field assignments:
+
+```ts
+          revisit_conditions: proposed.revisit_conditions ?? "",
+          review_after: proposed.review_after ?? null,
+          scope: proposed.scope_type && proposed.scope_id
+            ? { type: proposed.scope_type as ScopeType, id: proposed.scope_id }
+            : deriveLegacyScope(item, await loadConfig(projectRoot)),
+          affected_files: proposed.affected_files ?? [...item.changed_files],
+          scope_aliases: proposed.scope_aliases ?? [],
+```
+
+**Async caveat:** `loadConfig` is async. The surrounding `confirm_pending` handler is already async (it awaits readInbox, readLedger, etc.), so `await loadConfig(projectRoot)` is fine — but inspect the exact handler context when editing. If `config` is already available as a local, use that instead.
+
+**Why `affected_files ?? item.changed_files`:** the `changed_files` on the envelope is always populated by the hook, even in legacy items. Using it is correct and informative — not a fabrication.
+
+**Why `scope_aliases: []`, `revisit_conditions: ""`, `review_after: null`:** standard empty-value conventions elsewhere in the codebase. Legacy items had no way to carry these, so empty is the honest answer.
+
+**Evidence weight for legacy items:** the existing code stamps `evidence_type: "confirmed_draft"` (weight 0.8) when verStatus is "confirmed". Per council feedback, this may overstate confidence for drafts that pre-date scope enrichment. v1.2.1 ships with the current evidence mapping — a future patch can introduce a `legacy_confirmed_draft` evidence type if dogfood shows these are low-quality. Do NOT add that in this patch.
+
+### 6c. Confirm no other reader needs updating
+
+```bash
+grep -rn "proposed_decision\|proposed_record" src/ --include="*.ts" | grep -v ".test.ts"
+```
+
+Expected hits:
+- `src/capture/hook.ts` — one `item.proposed_record` write (and possibly a type-reference to `ProposedDecisionDraft`).
+- `src/ledger/events.ts` — both field declarations on `InboxItem`.
+- `src/mcp/write-tools.ts` — one `proposed_record` write in `propose_decision` (existing), one `proposed_record ?? proposed_decision` read in `confirm_pending`.
+- `src/mcp/smoke-test.ts` — one cast to `proposed_record` (existing, no change).
+- `src/ledger/index.ts` — type re-exports.
+
+**Zero hits in `src/retrieval/packs.ts`, `src/cli.ts`, `src/mcp/read-tools.ts`.** Those files do NOT read the draft payload. Do not edit them. (The feature request mentions them but code-inspection confirms they pass InboxItem through transparently.)
+
+### Validation gate — Phase 6
+
+```bash
+npx tsc --noEmit 2>&1 | grep "src/mcp/write-tools.ts"
+grep -c "proposed_decision" src/mcp/write-tools.ts   # expect 1 (the fallback read)
+grep -c "proposed_record" src/mcp/write-tools.ts     # expect ≥ 2 (write + read)
+```
+
+Expected:
+- Zero TS errors in write-tools.ts.
+- Exactly one `proposed_decision` reference (the legacy fallback).
+- At least two `proposed_record` references.
+
+### STOP AND REPORT — end of Phase 6
+
+Report: fallback added; `deriveLegacyScope` wired (no sentinel); no other reader needs an edit; write-tools.ts typechecks cleanly.
+
+---
+
+## Phase 6.5: CLI query visibility for scope fields
+
+**Goal:** make the Bug 8 fix visible to users via `context-ledger query`. Currently `src/cli.ts handleQuery` renders only envelope fields on pending inbox items — users can't see the newly-populated scope without inspecting the JSONL.
+
+**File:** `src/cli.ts`.
+
+Locate the pending-inbox rendering block (around lines 210-216, search for the `pending_inbox_items` iteration). For each item, if the draft payload carries scope_type and scope_id, print them on a continuation line:
+
+```ts
+for (const i of pack.pending_inbox_items) {
+  console.log(`  [${i.inbox_id}] ${i.type} — ${i.change_category} — ${i.commit_sha?.slice(0, 8) ?? "-"}`);
+  console.log(`    ${i.commit_message}`);
+  // v1.2.1 — surface scope fields when present (via proposed_record, with legacy proposed_decision fallback).
+  const draft = i.proposed_record ?? (i as unknown as { proposed_decision?: ProposedDecisionDraft }).proposed_decision;
+  if (draft?.scope_type && draft?.scope_id) {
+    console.log(`    scope: ${draft.scope_type}/${draft.scope_id}`);
   }
 }
 ```
 
-Import `readFile` from `node:fs/promises` at the top of the test file (merge with existing import).
+Match the existing cli.ts indentation/style (spaces vs tabs, single vs double quotes, console.log vs console.error). Inspect the existing block before editing. Import `ProposedDecisionDraft` if needed (merge into an existing events.js import).
 
-### 7.5 Test G — Response Shape Snapshot (Bucket 1 fix 1.11)
+### Validation gate — Phase 6.5
+
+```bash
+npx tsc --noEmit 2>&1 | grep "src/cli.ts"
+grep -n "scope_type\|scope_id" src/cli.ts
+```
+
+Expected: zero TS errors in cli.ts; at least one render site.
+
+### STOP AND REPORT — end of Phase 6.5
+
+Report: CLI renders scope fields for pending inbox items; legacy fallback still handled; typechecks clean.
+
+---
+
+## Phase 7: Tests
+
+**Goal:** all automated tests pass, including new tests for the four bugs.
+
+### 7a. Update `src/capture/hook.test.ts`
+
+Rename 9 `proposed_decision` references at lines 160, 161, 163, 165, 166, 167, 170, 171, 207, 208 to `proposed_record`. These are assertions on the inbox item's drafted-payload field — now emitted under the new key.
+
+Example:
+```ts
+// BEFORE (line 160-161)
+assert(
+  draftNeeded.proposed_decision !== undefined,
+  "draft_needed item carries proposed_decision",
+);
+
+// AFTER
+assert(
+  draftNeeded.proposed_record !== undefined,
+  "draft_needed item carries proposed_record",
+);
+```
+
+Update the assertion label text too so failures surface the canonical name.
+
+**Add Test 7 — revert within window suppresses the revert's draft.** Structure mirrors Test 5:
 
 ```ts
-async function testG_responseShapeSnapshot(tmpDir: string): Promise<void> {
-  console.error("\nTest G: pack response shape matches expected keys");
-  await writeConfig(tmpDir, { capture: { scope_mappings: {} }, retrieval: { token_budget: 4000 } });
+async function test7RevertWithinWindowSuppressed(): Promise<void> {
+  console.error("\nTest 7: feat + revert within window → revert suppressed");
+  installMock(async () => mockSuccessResponse());
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "sk-mock";
 
-  const pack = await queryDecisions({ scope_type: "domain", scope_id: "empty" }, tmpDir);
-  const keys = Object.keys(pack).sort().join(",");
-  const expected = [
-    "abandoned_approaches",
-    "active_precedents",
-    "derived_scope",
-    "mistakes_in_scope",
-    "no_precedent_scopes",
-    "pending_inbox_items",
-    "recently_superseded",
-    "token_estimate",
-    "truncated",
-  ].join(",");
-  assert(keys === expected, `pack keys match: got ${keys}`);
-  assert(Array.isArray(pack.mistakes_in_scope), "mistakes_in_scope is an array");
+  const root = await bootstrapRepo();
+  try {
+    await writeConfig(root, true);
+    // Feat commit — triggers hook.
+    await commitNewAuthDir(root);
+    await runPostCommitIn(root);
+    const afterFeat = await readInboxItems(root);
+    const featDraftCount = afterFeat.filter((i) => i.type === "draft_needed").length;
+
+    // Revert commit immediately.
+    const git = (args: string[]) =>
+      execFileSync("git", args, { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
+    git(["revert", "--no-edit", "HEAD"]);
+    await runPostCommitIn(root);
+    const afterRevert = await readInboxItems(root);
+    const revertDraftCount = afterRevert.filter((i) => i.type === "draft_needed").length;
+
+    // Total inbox count is unchanged — the revert commit added ZERO items.
+    assert(
+      revertDraftCount === featDraftCount,
+      `revert added zero draft_needed items (feat=${featDraftCount}, after-revert=${revertDraftCount})`,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevKey;
+    restoreMock();
+  }
 }
 ```
 
-Register Tests F and G in the runner at the bottom of the file.
+**Add Test 8 — revert outside window drafts normally.** Use `GIT_AUTHOR_DATE` / `GIT_COMMITTER_DATE` to place the feat 48h in the past:
 
-### Phase 7 Validation Gate
+```ts
+async function test8RevertOutsideWindowDrafts(): Promise<void> {
+  console.error("\nTest 8: feat 48h ago + revert now → revert drafts normally");
+  installMock(async () => mockSuccessResponse());
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "sk-mock";
 
-```bash
-npm run build
-npm run smoke
+  const root = await bootstrapRepo();
+  try {
+    await writeConfig(root, true);
+    const oldDate = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+    const gitOld = (args: string[]) =>
+      execFileSync("git", args, {
+        cwd: root,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, GIT_AUTHOR_DATE: oldDate, GIT_COMMITTER_DATE: oldDate },
+      });
+    await mkdir(join(root, "src", "feat48h"), { recursive: true });
+    await writeFile(join(root, "src", "feat48h", "a.ts"), "export const a = 1;\n", "utf8");
+    gitOld(["add", "-A"]);
+    gitOld(["commit", "-q", "-m", "feat: old module skeleton"]);
+    await runPostCommitIn(root);
+    const afterFeat = await readInboxItems(root);
+    const featCount = afterFeat.filter((i) => i.type === "draft_needed").length;
+    assert(featCount >= 1, `feat commit (48h ago) drafted ≥1 inbox item (got ${featCount})`);
+
+    // Now revert it at current time.
+    execFileSync("git", ["revert", "--no-edit", "HEAD"], {
+      cwd: root,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    await runPostCommitIn(root);
+    const afterRevert = await readInboxItems(root);
+    const revertNew = afterRevert.filter((i) => i.type === "draft_needed").length - featCount;
+    assert(
+      revertNew >= 1,
+      `revert (outside window) drafted ≥1 item (added ${revertNew})`,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevKey;
+    restoreMock();
+  }
+}
 ```
 
-**Expected:**
-- `npm run build` — zero errors.
-- `npm run smoke` — all prior tests still pass, plus the new ones (A–E + end-to-end). Exit 0.
+**Add Test 9 — scope-field population.** Verify the hook-drafted item carries `scope_type`, `scope_id`, `affected_files`:
 
-If `npm run smoke` is not defined, run `node dist/retrieval/smoke-test.js && node dist/smoke.js`.
+```ts
+async function test9ScopePopulated(): Promise<void> {
+  console.error("\nTest 9: hook-drafted inbox item carries scope fields");
+  installMock(async () => mockSuccessResponse());
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  process.env.ANTHROPIC_API_KEY = "sk-mock";
 
-**STOP AND REPORT** — show smoke output with all assertions. Commit: `feat(retrieval-mistakes): phase 7 — smoke tests for mistakes_in_scope`.
+  const root = await bootstrapRepo();
+  try {
+    await writeConfig(root, true);
+    await commitNewAuthDir(root);
+    await runPostCommitIn(root);
+
+    const items = await readInboxItems(root);
+    const draftNeeded = items.find((i) => i.type === "draft_needed");
+    assert(draftNeeded !== undefined, "a draft_needed item was created");
+    if (draftNeeded?.proposed_record) {
+      const pr = draftNeeded.proposed_record;
+      assert(
+        typeof pr.scope_type === "string" && pr.scope_type.length > 0,
+        `proposed_record.scope_type is set (got ${pr.scope_type})`,
+      );
+      assert(
+        typeof pr.scope_id === "string" && pr.scope_id.length > 0,
+        `proposed_record.scope_id is set (got ${pr.scope_id})`,
+      );
+      assert(
+        Array.isArray(pr.affected_files) && pr.affected_files.length > 0,
+        `proposed_record.affected_files is populated (got ${pr.affected_files?.length})`,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevKey;
+    restoreMock();
+  }
+}
+```
+
+**Register the new tests** — add calls to `test7RevertWithinWindowSuppressed`, `test8RevertOutsideWindowDrafts`, `test9ScopePopulated` in the runner block at the bottom of hook.test.ts (follow the pattern used for tests 5 and 6).
+
+### 7b. Create `src/capture/classify.test.ts` — NEW FILE for Bug 10
+
+```ts
+// context-ledger — classify.ts unit tests (Bug 10: editor-backup suppression)
+// Standalone script: exit 0 on pass, 1 on fail.
+
+import { classifyCommit } from "./classify.js";
+import type { LedgerConfig } from "../config.js";
+import { DEFAULT_CONFIG } from "../config.js";
+
+let passed = 0;
+let failed = 0;
+
+function assert(condition: boolean, label: string): void {
+  if (condition) {
+    passed++;
+    console.error(`  ✓ ${label}`);
+  } else {
+    failed++;
+    console.error(`  ✗ ${label}`);
+  }
+}
+
+function makeConfig(): LedgerConfig {
+  return JSON.parse(JSON.stringify(DEFAULT_CONFIG)) as LedgerConfig;
+}
+
+function hasFileDeletion(results: ReturnType<typeof classifyCommit>): boolean {
+  return results.some((r) => r.change_category === "file-deletion");
+}
+
+function fileDeletionFiles(results: ReturnType<typeof classifyCommit>): string[] {
+  const r = results.find((x) => x.change_category === "file-deletion");
+  return r?.changed_files ?? [];
+}
+
+async function test1BackupOnlySuppressed(): Promise<void> {
+  console.error("\nTest 1: backup-only deletions produce no file-deletion classification");
+  const config = makeConfig();
+  const all = ["foo.bak", "bar.orig"];
+  const del = ["foo.bak", "bar.orig"];
+  const add: string[] = [];
+  const results = classifyCommit(all, del, add, "chore: cleanup", config, null);
+  assert(!hasFileDeletion(results), "no file-deletion classification emitted");
+}
+
+async function test2MixedDeletionKeepsReal(): Promise<void> {
+  console.error("\nTest 2: mixed deletion (backup + real) classifies only real file");
+  const config = makeConfig();
+  const all = ["foo.bak", "src/real.ts"];
+  const del = ["foo.bak", "src/real.ts"];
+  const add: string[] = [];
+  const results = classifyCommit(all, del, add, "refactor: remove real.ts", config, null);
+  assert(hasFileDeletion(results), "file-deletion classification emitted");
+  const files = fileDeletionFiles(results);
+  assert(files.includes("src/real.ts"), "real.ts in changed_files");
+  assert(!files.includes("foo.bak"), "foo.bak filtered out of changed_files");
+}
+
+async function test3GitignoreAndBackupsSuppressed(): Promise<void> {
+  console.error("\nTest 3: .gitignore + backup deletions produce no file-deletion");
+  const config = makeConfig();
+  const all = [".gitignore", "foo.bak"];
+  const del = ["foo.bak"];
+  const add: string[] = [];
+  const results = classifyCommit(all, del, add, "chore: ignore bak", config, null);
+  assert(!hasFileDeletion(results), "no file-deletion classification emitted");
+}
+
+async function test4CustomPatterns(): Promise<void> {
+  console.error("\nTest 4: custom editor_backup_patterns honored");
+  const config = makeConfig();
+  config.capture.classifier.editor_backup_patterns = ["*.local"];
+  const all = ["notes.local", "src/real.ts"];
+  const del = ["notes.local", "src/real.ts"];
+  const add: string[] = [];
+  const results = classifyCommit(all, del, add, "cleanup", config, null);
+  assert(hasFileDeletion(results), "file-deletion classification emitted (real.ts remains)");
+  const files = fileDeletionFiles(results);
+  assert(!files.includes("notes.local"), "custom-pattern file suppressed");
+  assert(files.includes("src/real.ts"), "real file retained");
+}
+
+async function test5WindowsPaths(): Promise<void> {
+  console.error("\nTest 5: backslash-separated paths still classified correctly (portability)");
+  const config = makeConfig();
+  // Simulate a call site that passes Windows-style paths (git diff-tree normally normalizes,
+  // but the classifier should be defensive). isEditorBackup strips backslashes before matching.
+  const all = ["src\\feature\\file.bak"];
+  const del = ["src\\feature\\file.bak"];
+  const add: string[] = [];
+  const results = classifyCommit(all, del, add, "cleanup", config, null);
+  assert(!hasFileDeletion(results), "backslash-path .bak deletion suppressed");
+}
+
+async function test6DotfileNotMatchedByHashStar(): Promise<void> {
+  console.error("\nTest 6: .env.example NOT matched by .#* pattern (no accidental dotfile suppression)");
+  const config = makeConfig();
+  const all = [".env.example", "src/real.ts"];
+  const del = [".env.example", "src/real.ts"];
+  const add: string[] = [];
+  const results = classifyCommit(all, del, add, "cleanup", config, null);
+  assert(hasFileDeletion(results), "file-deletion classification emitted");
+  const files = fileDeletionFiles(results);
+  assert(files.includes(".env.example"), ".env.example retained (not matched by .#*)");
+  assert(files.includes("src/real.ts"), "src/real.ts retained");
+}
+
+async function main(): Promise<void> {
+  await test1BackupOnlySuppressed();
+  await test2MixedDeletionKeepsReal();
+  await test3GitignoreAndBackupsSuppressed();
+  await test4CustomPatterns();
+  await test5WindowsPaths();
+  await test6DotfileNotMatchedByHashStar();
+
+  console.error(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed === 0 ? 0 : 1);
+}
+
+main().catch((err) => {
+  console.error("fatal:", err);
+  process.exit(1);
+});
+```
+
+**Confirm `classifyCommit`'s parameter order matches:** code-inspector findings show `classifyCommit(changedFiles, deletedFiles, addedFiles, commitMessage, config, packageJsonDiff?)`. If the actual signature differs when you read the file, adapt the test accordingly — the parameter names are documentation, not contract.
+
+### 7c. Optional — `src/smoke.ts` end-to-end test
+
+Not strictly required (hook.test.ts Test 9 covers scope population end-to-end). Skip unless you want redundant coverage.
+
+### Validation gate — Phase 7
+
+```bash
+npm run build 2>&1 | tail -5
+node dist/capture/hook.test.js
+node dist/capture/classify.test.js
+node dist/capture/drafter.test.js
+node dist/smoke.js
+node dist/retrieval/smoke-test.js
+node dist/mcp/smoke-test.js
+```
+
+Expected:
+- `npm run build` exits 0 with no errors.
+- All six test scripts exit 0.
+- hook.test.ts reports at least 9 tests passed (5, 6 renamed; 7, 8, 9 new).
+- classify.test.ts reports 6 tests passed (backup-only, mixed, .gitignore+backups, custom, Windows paths, dotfile-not-matched).
+
+### STOP AND REPORT — end of Phase 7
+
+Report: build clean; all tests pass; new-test counts listed. Any failure must be resolved before Phase 8.
 
 ---
 
-## Phase 8 — Design Spec Update
+## Phase 8: Documentation Sync
 
-**Goal:** extend `context-ledger-design-v2.md` to document the retrieval contract extension.
+**Goal:** regenerate `docs/_generated/*`, update design spec + CHANGELOG. Do NOT bump `package.json` version.
 
-### 8.1 Locate the Retrieval section
-
-Search for "Decision Pack Response" and "token_budget" in the spec. Add a new subsection titled `### mistakes_in_scope (added vN+1)` directly under the Decision Pack Response section.
-
-### 8.2 Document the following exactly
-
-Write prose in the spec's existing voice. Include:
-
-1. **What it is.** "A dedicated array of antipatterns surfaced before active precedents, so token-truncated packs retain the highest-signal-per-token data (what not to do)."
-2. **Three kinds.** Union members with field lists, mirroring §3.1 of exploration-results.md.
-3. **Sources.** Populated entirely from the existing fold output + dismissed inbox items. No new events. No `DecisionRecord` / `TransitionEvent` schema changes. Call this out explicitly: **"This is a retrieval-contract extension. Event schemas (DecisionRecord, TransitionEvent) are untouched; the fold-logic audit confirms no event-schema change."**
-4. **Exclusions.** `commit_inferred` records (weight 0.2) are excluded from `mistakes_in_scope` even in abandoned/superseded state. `feature-local` records excluded by default; pass `include_feature_local: true` to opt in (flag bypasses the existing feature-local filter globally).
-5. **Trim priority — Option A, spec-literal (user-locked).** Document the sequence: `active_precedents` (from tail) → `recently_superseded` → `abandoned_approaches` → `pending_inbox_items` (cap, then pop) → `mistakes_in_scope` (last casualty). Cite the rationale: antipatterns are the irrecoverable signal under token pressure. A heavily truncated pack returns all mistakes and zero active precedents — this is intentional.
-6. **Scope rules.** Same derivation paths as `active_precedents` (explicit, file_path via scope_mappings → scope_aliases → directory fallback, feature_hint_mappings, recency fallback). For rejected inbox items: `changed_files` must intersect the derived scope via the same derivation order (scope_mappings → scope_aliases → directory fallback); empty `changed_files` falls back to `commit_message` substring match. When `derivedScope === null` (recency fallback), include the N=10 most recent dismissed inbox items with `rejection_reason`, sorted by `rejected_at` desc.
-7. **CLI render.** The `context-ledger query` command now calls `queryDecisions` (replacing `searchDecisions`) and renders the full decision pack. Mistakes are the first section; active precedents second.
-8. **Tidy interaction.** Rejected-inbox mistakes are subject to the existing 30-day `tidyInbox` TTL. Dismissed items older than 30 days are removed and can no longer surface.
-
-### 8.3 Separate decision: ratify `rejection_reason` as a typed `InboxItem` field
-
-Add a distinct spec decision (not folded into the mistakes_in_scope entry). Proposed wording:
-
-> **v2.4: `rejection_reason` promoted to typed optional field on `InboxItem`.** The field was previously persisted via an out-of-schema dynamic cast (`as unknown as Record<string, unknown>`) at `write-tools.ts:261`. This ratification promotes it to `rejection_reason?: string` on the documented `InboxItem` interface. Rationale: eliminates the ugly cast and lets the retrieval layer consume the field with full type safety. Not an event-schema change — `InboxItem` is a workflow queue entry, distinct from `DecisionRecord` / `TransitionEvent`. Append-only JSONL invariant applies to `ledger.jsonl` events; `inbox.jsonl` already uses atomic `rewriteInbox` for terminal-state transitions. Backward compatible: pre-ratification items written with the dynamic field parse correctly under the new typed interface (optional field, existing values persist).
-
-Add this entry to the design-decisions table at the bottom of `context-ledger-design-v2.md` with attribution **"v2.4: Arbiter (user triage, council pass 1)"**.
-
-### 8.4 Update the `query_decisions` param table
-
-Add a row:
-- `include_feature_local | bool | false | Opt in to feature-local durability records across all sections. Bypasses the default feature-local filter globally.`
-
-### 8.5 Update the Decision Pack Response schema block
-
-Add `"mistakes_in_scope": [...]` to the sample JSON response immediately after `"recently_superseded"`. Add a comment line: `// Antipatterns surfaced first under token pressure (Option A trim order)`.
-
-### Phase 8 Validation Gate
-
-```bash
-grep -n "mistakes_in_scope" context-ledger-design-v2.md
-grep -n "include_feature_local" context-ledger-design-v2.md
-grep -n "retrieval-contract extension" context-ledger-design-v2.md
-grep -n "rejection_reason" context-ledger-design-v2.md
-grep -n "v2.4" context-ledger-design-v2.md
-```
-
-**Expected:** all five present. `rejection_reason` appears in the ratification decision entry.
-
-**STOP AND REPORT** — show grep output. Commit: `docs(spec): mistakes_in_scope retrieval contract + rejection_reason ratification`.
-
----
-
-## Phase 9 — Documentation Sync + Final Validation
-
-### 9.1 Run agent-guard sync
+### 8a. Run agent-guard sync
 
 ```bash
 npx agent-guard sync
+git status --porcelain docs/
 ```
 
-Review its proposed doc changes. If it updated `docs/ARCHITECTURE.md` sections that describe retrieval/MCP, confirm the diff is accurate and stage it. The CLAUDE.md Documentation Maintenance section says: for `src/*` changes, update the Architecture section in `docs/ARCHITECTURE.md` in the same session.
+Review the diff. Expected regenerations: `docs/_generated/env-vars.md` likely has no changes (no env var added); `docs/ARCHITECTURE.md` may pick up updated module descriptions if the tool regenerates them.
 
-If agent-guard's hook is in blocking mode, docs MUST be up to date before you can commit. Read the changed source files, update `docs/ARCHITECTURE.md` manually if needed, `git add`, retry commit. Do NOT run `npx agent-guard sync` to try to auto-fix — CLAUDE.md explicitly forbids this pattern for AI-triggered commits.
+**If agent-guard sync proposes changes you don't understand, STOP AND REPORT.** Read the diff, decide whether the changes are expected, then either stage them or skip.
 
-### 9.2 Final build + smoke + hook check
+### 8b. Update `context-ledger-design-v2.md` v2.4 → v2.4.1
+
+Find the version stamp near the top of the spec. Bump to `2.4.1`.
+
+Add four decision-table entries matching the existing row format. Four entries:
+
+- **Payload-key unification (Bug 7)** — Unify inbox draft payload key on `proposed_record`. Keep `proposed_decision` as legacy read-only alias. Source: `dogfood 2026-04-19`.
+- **Scope-field population (Bug 8)** — Hook-drafted inbox items populate `scope_type`, `scope_id`, `affected_files`, `scope_aliases` at draft time via existing `deriveScope`. Source: `dogfood 2026-04-19`.
+- **Same-day revert suppression (Bug 9)** — Hook drafts suppressed when feat+revert pair exists inside `capture.drafter.revert_suppression_window_hours` (default 24h). Fail-open on `git log` error. Source: `dogfood 2026-04-19`.
+- **Editor-backup classifier suppression (Bug 10)** — `file-deletion` classification suppressed when all deletions match `capture.classifier.editor_backup_patterns` (default list). Mixed commits still classify real deletions. Source: `dogfood 2026-04-19`.
+
+If the spec's decision table prefers density, combine Bugs 9 and 10 into one "classifier hygiene (v1.2.1)" entry. Match existing cadence.
+
+### 8c. Update `CHANGELOG.md`
+
+Prepend to the top, mirroring v1.2.0's bullet-prefix style. Use the release day date:
+
+```markdown
+## v1.2.1 — 2026-04-20
+
+- **capture**: Hook-drafted inbox items now populate `scope_type`, `scope_id`, `affected_files`, and `scope_aliases` at draft time via the existing `deriveScope` helper. Draft items become retrievable via file-path queries and `mistakes_in_scope` — previously they only surfaced via broad recency fallback.
+- **capture**: Inbox draft payload key unified on `proposed_record`. The hook drafter previously wrote under `proposed_decision`; the MCP `propose_decision` tool already wrote under `proposed_record`. Readers fall back to `proposed_decision` for legacy data — no migration required.
+- **capture**: Hook drafter suppresses drafts on same-day revert pairs. Configurable via `capture.drafter.revert_suppression_window_hours` (default 24). When a commit is revert-referenced by another commit inside the window — or is itself a revert of a within-window commit — the draft is skipped. Outside the window, both commits draft normally. Note: the suppression fires when the revert lands, so a feat drafted a minute earlier stays in the inbox — users may reject it manually.
+- **classify**: `file-deletion` classifier suppresses commits whose deletions are entirely editor-backup files. Configurable via `capture.classifier.editor_backup_patterns` (default `*.bak`, `*.orig`, `*.swp`, `*.swo`, `*~`, `.#*`). Mixed commits (backup + real source deletion) still classify the real deletion.
+- **schema**: Purely additive. `InboxItem.proposed_record` added alongside legacy `InboxItem.proposed_decision`. `ProposedDecisionDraft` extended with optional scope fields. No changes to `ledger.jsonl` event schema, no changes to MCP tool annotations, no new runtime dependencies.
+- **spec**: `context-ledger-design-v2.md` v2.4 → v2.4.1 with four decision-table entries.
+```
+
+### 8d. Confirm package.json is untouched
 
 ```bash
-npm run build
-npm run smoke
-# Hot-path no-op verification (Bucket 1 fix 1.8)
-git diff --stat src/capture/ | wc -l       # must be 0
-git diff --stat scripts/post-commit.* 2>/dev/null | wc -l  # must be 0
-# Also check that agent-guard sync did not modify capture paths
-git status --porcelain src/capture/ scripts/post-commit.* 2>/dev/null | wc -l  # must be 0
-grep -c "console.log" src/index.ts 2>/dev/null || echo "no console.log (good)"
+git diff package.json
 ```
 
-**Expected:**
-- Build passes. Smoke passes.
-- `src/capture/` untouched.
-- Post-commit hook untouched.
-- No `console.log` in `src/index.ts` (MCP stdio reserved for JSON-RPC).
+Expected: no output. Version bump happens at release time via `npm version patch`.
 
-### 9.3 Manual verification
-
-From a scratch directory:
+### Validation gate — Phase 8
 
 ```bash
-# Build once
-npm run build
-
-# Seed a throwaway ledger with an abandoned decision + supersede with pain_points
-# (use the smoke-test helpers or hand-write JSONL)
-node -e "/* seed a .context-ledger/ledger.jsonl in a tmp dir */"
-
-# Run the CLI query against that dir
-./dist/cli.js query "retrieval" --project-root /tmp/ledger-manual
+git status --porcelain
+git diff --stat docs/_generated/ context-ledger-design-v2.md CHANGELOG.md
 ```
 
-Confirm the "Prior mistakes in this scope" section appears before active results.
+Expected:
+- Working tree shows edits to src/ (Phases 2–7) plus `docs/_generated/`, `context-ledger-design-v2.md`, and `CHANGELOG.md`.
+- No edits to `package.json`.
 
-### 9.4 Final commit + PR prep
+### STOP AND REPORT — end of Phase 8
 
-Commit: `feat(retrieval-mistakes): phase 9 — docs sync and final validation`.
-
-Then prepare a summary PR description that:
-- Links to this implementation guide.
-- Summarizes the eight prior phase commits.
-- Calls out: zero event schema changes, zero hook changes, zero runtime dependencies added.
-- Includes sample `query_decisions` output showing the new section.
-
-**STOP AND REPORT** — share build/smoke output and the PR description. Wait for user go-ahead to push.
+Report: agent-guard sync complete; design spec v2.4.1 entries added; CHANGELOG v1.2.1 entry added; package.json untouched.
 
 ---
 
-## Appendix A — Invariants Checklist (verify at every STOP AND REPORT)
+## Phase 9: Final Validation + Manual Smoke
 
-- [ ] JSONL append-only — this feature writes nothing to `ledger.jsonl` or `inbox.jsonl`.
-- [ ] Post-commit hook untouched — `src/capture/` has zero diff.
-- [ ] Fold logic untouched — `src/ledger/fold.ts` has zero diff.
-- [ ] Event schema untouched — `DecisionRecord`, `TransitionEvent` unchanged; only `InboxItem` gains one optional field.
-- [ ] All imports use `.js` extensions.
-- [ ] MCP annotations on `query_decisions` preserved: `readOnlyHint: true, destructiveHint: false, openWorldHint: false`.
-- [ ] Zero new runtime dependencies.
-- [ ] `commit_inferred` (weight 0.2) excluded from `mistakes_in_scope`.
-- [ ] `feature-local` excluded by default; `include_feature_local: true` opts in.
-- [ ] `superseded` remains terminal — this feature reads `pain_points` but never writes transitions.
+**Goal:** prove the patch is green end-to-end, ready for release.
 
-## Appendix B — Rollback
-
-This feature is strictly additive. To revert:
+### 9a. Full build
 
 ```bash
-git revert <phase-9-sha>..<phase-1-sha>
+npm run build 2>&1 | tail -5
 ```
 
-All nine commits are reversible in one sequence. No data migration. `inbox.jsonl` items written with typed `rejection_reason` remain readable by pre-feature code because the field was previously dynamic.
+Expected: exit 0, no errors.
+
+### 9b. Full automated test suite
+
+```bash
+node dist/smoke.js
+node dist/retrieval/smoke-test.js
+node dist/mcp/smoke-test.js
+node dist/capture/hook.test.js
+node dist/capture/drafter.test.js
+node dist/capture/classify.test.js
+```
+
+Expected: every script exits 0.
+
+### 9c. Manual hook smoke — Bug 9 end-to-end
+
+Seed a temp repo with a feat commit and an immediate revert. Verify revert adds no new inbox line. Use drafter DISABLED so no ANTHROPIC_API_KEY is required:
+
+```bash
+DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'cl-smoke')
+pushd "$DIR"
+git init -q
+git config user.email t@e.com
+git config user.name t
+git config commit.gpgsign false
+echo "# x" > README.md
+git add -A && git commit -q -m "seed"
+mkdir -p .context-ledger
+cat > .context-ledger/config.json <<'EOF'
+{"capture":{"enabled":true,"ignore_paths":[],"scope_mappings":{},"redact_patterns":[],"no_capture_marker":"[no-capture]","inbox_ttl_days":14,"inbox_max_prompts_per_item":3,"inbox_max_items_per_session":3,"drafter":{"enabled":false,"revert_suppression_window_hours":24},"classifier":{"editor_backup_patterns":["*.bak"]}},"retrieval":{"default_limit":20,"include_superseded":false,"include_unreviewed":false,"auto_promotion_min_weight":0.7,"token_budget":4000,"feature_hint_mappings":{}},"workflow_integration":{"selective_writeback":true,"check_inbox_on_session_start":true,"jit_backfill":true},"monorepo":{"package_name":null,"root_relative_path":null}}
+EOF
+mkdir -p src/newmod
+echo "export const a = 1" > src/newmod/a.ts
+git add -A && git commit -q -m "feat: add newmod"
+CONTEXT_LEDGER_PROJECT_ROOT="$DIR" node C:/Users/russe/Documents/Context_Ledger/dist/capture/hook.js
+wc -l .context-ledger/inbox.jsonl  # expect 1
+git revert --no-edit HEAD
+CONTEXT_LEDGER_PROJECT_ROOT="$DIR" node C:/Users/russe/Documents/Context_Ledger/dist/capture/hook.js
+wc -l .context-ledger/inbox.jsonl  # expect still 1 (revert suppressed)
+popd
+rm -rf "$DIR"
+```
+
+### 9d. Manual hook smoke — Bug 10 end-to-end
+
+Similar script — commit that deletes only `.bak` files. Verify no inbox item emitted. Drafter disabled:
+
+```bash
+# inside a fresh temp repo with same config.json as above
+echo "old" > trash.bak
+git add trash.bak && git commit -q -m "add backup"
+CONTEXT_LEDGER_PROJECT_ROOT="$DIR" node /path/to/context-ledger/dist/capture/hook.js
+wc -l .context-ledger/inbox.jsonl  # baseline
+
+rm trash.bak
+git add -A && git commit -q -m "cleanup: remove backup file"
+CONTEXT_LEDGER_PROJECT_ROOT="$DIR" node /path/to/context-ledger/dist/capture/hook.js
+wc -l .context-ledger/inbox.jsonl  # expect unchanged from baseline
+```
+
+### 9e. Inbox inspection — Bug 8 scope population (requires ANTHROPIC_API_KEY or mock)
+
+After a real drafter run with the SDK mocked (or a real API key), inspect:
+
+```bash
+cat .context-ledger/inbox.jsonl | jq -r '.proposed_record | {scope_type, scope_id, affected_files}'
+```
+
+Expected: scope_type is a valid ScopeType string; scope_id is non-empty; affected_files is a non-empty array matching the commit's changed files.
+
+### 9f. Bug 7 legacy-fallback sanity check
+
+The TypeScript defaulting in Phase 6 is proven correct by the type checker. Crafting a hand-written legacy inbox line to run through `confirm_pending` is optional — skip unless time permits.
+
+### Validation gate — Phase 9
+
+```bash
+# Summary check
+git status --porcelain | wc -l    # expect >0 (the patch's edits)
+npm run build                      # exit 0
+for t in dist/smoke.js dist/retrieval/smoke-test.js dist/mcp/smoke-test.js \
+         dist/capture/hook.test.js dist/capture/drafter.test.js dist/capture/classify.test.js; do
+  node "$t" || echo "FAILED: $t"
+done
+```
+
+All six tests must pass. Zero `FAILED:` lines.
+
+### STOP AND REPORT — end of Phase 9
+
+Final report:
+1. Full test-script pass counts.
+2. Manual smoke results for Bugs 7-10.
+3. `git diff --stat` summary of all changes.
+4. Ready for release: `npm version patch && git push --follow-tags && npm publish`.
+
+Do NOT run `npm version patch`, `git push`, or `npm publish` in this phase. Those are release-driver actions — the patch ends at a clean, tested working tree.
 
 ---
 
-## Appendix C — Refinement Log
+## Post-Implementation — Release Checklist (NOT part of this guide)
 
-**Council review pass 1** (Gemini 3.1 Pro + Codex gpt-5.4) produced `council-feedback.md`. Triage in `triage-results.md`. 13 Bucket 1 fixes applied autonomously to this guide:
-
-1. **Fix 1.1 (Phase 2.2):** Added dedup step — records in `mistakes_in_scope` are removed from `abandoned_approaches` and `recently_superseded` to prevent token budget double-counting.
-2. **Fix 1.2 (Phase 3.2):** `inboxItemIntersectsScope` now scans `scope_aliases[]` on active decisions (mirrors `scope.ts:65–73`).
-3. **Fix 1.3 (Phase 5):** CLI render replaced `if/else` with exhaustive `switch(m.kind) { ... default: assertNever }`.
-4. **Fix 1.4 (Phase 1):** Added `grep -rn ": DecisionPack" src/ | grep -v packs.ts | wc -l` to validation gate (must be 0).
-5. **Fix 1.5 (Phase 3.2):** Empty `changed_files` falls back to `commit_message` substring match against `scope.id`.
-6. **Fix 1.6 (Phase 3.3):** Clarified rejected inbox items are not filtered by durability (durability is a `DecisionRecord` field, not an `InboxItem` field).
-7. **Fix 1.7 (Phase 6.2):** Explicit `readOnlyHint: true` annotation-unchanged check added.
-8. **Fix 1.8 (Phase 9.2):** Added hot-path no-op verification — `git status --porcelain src/capture/ scripts/post-commit.*` must show zero lines after `agent-guard sync`.
-9. **Fix 1.9 (Phase 1 & 8):** Documented that no Zod response schema exists — response-shape change is implicit via `DecisionPack` TS interface only.
-10. **Fix 1.10 (Phase 7.4):** Added Test F — zero-write contract (compares ledger/inbox bytes pre/post query).
-11. **Fix 1.11 (Phase 7.5):** Added Test G — response-shape snapshot.
-12. **Fix 1.12 (Phase 3.2):** Helper now explicitly comments that it mirrors `scope.ts:31–102` and must be updated in lockstep.
-13. **Fix 1.13 (Phase 2.2):** `commit_inferred` exclusion-asymmetry rationale added as code comment.
-
-**Council pass 1 Bucket 2 resolutions (user triage, 2026-04-19):**
-
-14. **Q1 → Phase 4.1:** Trim order rewritten to Option A (spec-literal): `active_precedents` trimmed from tail FIRST, then `recently_superseded`, then `abandoned_approaches`, then `pending_inbox_items` (cap + pop), and `mistakes_in_scope` is the last casualty. Test D updated to assert `active_precedents.length === 0` under heavy pressure.
-15. **Q2 → Phase 1.1 + Phase 6.1 + Phase 8.3:** `rejection_reason` ratified as typed optional field on `InboxItem`. Dynamic cast removed. Phase 8 now records this as a separate spec decision (v2.4), not folded into the mistakes_in_scope entry.
-16. **Q3 → Phase 5.1 + Phase 5.2:** CLI `query` now calls `queryDecisions` exclusively and renders the full decision pack (mistakes first, then active, abandoned, superseded, inbox). `searchDecisions` may be deleted if grep confirms zero consumers.
-17. **Q4 → Phase 3.3:** Recency fallback (`derivedScope === null`) now includes the N=10 most recent dismissed inbox items with `rejection_reason`, sorted by `rejected_at` desc. Added Test H to verify cap + sort.
-
-**Bucket 2 cleared. Guide is ready to execute.**
+The release is driven separately by the maintainer:
+1. `npm version patch` → 1.2.0 → 1.2.1.
+2. `git push origin master --follow-tags`.
+3. `npm publish` (2FA OTP required).
+4. Verify: `npm view context-ledger version` prints `1.2.1`.
 
 ---
 
-## Appendix D — Human Input Gate (RESOLVED — council pass 1 triage)
+## Appendix A — Import Merges (never additions)
 
-All four Bucket 2 questions answered by the user. Guide updated accordingly.
+If a file already imports from a module, merge new names into the existing import. Example:
 
-| Q | Decision | Applied in |
-|---|----------|-----------|
-| Q1 | **Option A** — spec-literal trim: active from tail → recently_superseded → abandoned_approaches → pending_inbox_items (cap + pop) → mistakes_in_scope last | Phase 4.1 |
-| Q2 | **Ratify** — `rejection_reason` promoted to typed optional field on `InboxItem`; dynamic cast removed | Phase 1.1, Phase 6.1, Phase 8.3 (separate spec decision) |
-| Q3 | **Replace** — `searchDecisions` swapped for `queryDecisions` in CLI; full decision pack rendered | Phase 5.1, Phase 5.2 (optional cleanup) |
-| Q4 | **Include capped at N=10** — recency fallback returns top 10 most recent dismissed inbox items with `rejection_reason` sorted by `rejected_at` desc | Phase 3.3 |
+```ts
+// Existing
+import { deriveScope } from "../retrieval/index.js";
 
-Guide is now ready for a fresh Claude Code session to execute end-to-end.
+// Adding DerivedScope — merge, don't duplicate
+import { deriveScope, type DerivedScope } from "../retrieval/index.js";
+```
+
+Never:
+```ts
+// WRONG — double import from same module
+import { deriveScope } from "../retrieval/index.js";
+import type { DerivedScope } from "../retrieval/index.js";
+```
+
+## Appendix B — Append-Only JSONL Guarantees
+
+This patch adds zero new writes to `ledger.jsonl`. All changes to `inbox.jsonl` go through existing `appendToInbox` (trailing newline guaranteed) or existing `rewriteInbox` (atomic rewrite, used only for TTL expiry). Verify:
+
+```bash
+grep -rn "appendToInbox\|rewriteInbox\|appendToLedger" src/ --include="*.ts"
+```
+
+No new append-or-rewrite call sites should appear as part of this patch.
+
+## Appendix C — Budget Check for Revert Shellout
+
+The new `git log -n 20` shellout runs <10ms on typical local repos. On pathological repos it could stretch. The try/catch around the call is fail-open — if git errors, the drafter proceeds normally. No timeout option is set on `execFileSync`, consistent with the existing hook-shellout style (lines 253-272). A follow-up patch can add per-shellout timeouts if profiling shows regressions; v1.2.1 does not.
+
+---
+
+## Refinement Log (Phase 4 — post-council)
+
+Council review surfaced by Codex (gpt-5.4 via local CLI) and Gemini (gemini-3.1-pro-preview). OpenAI unavailable (quota exhausted); the `/auto-feature` council review in this repo permanently switches to codex + gemini (see `.claude/projects/.../memory/feedback_council_codex_gemini.md`).
+
+**Bucket 1 — applied autonomously:**
+
+1. **Phase 5 — Windows shell-expansion fix.** Switched `execSync` with string command to `execFileSync` with argv array. `%H`/`%ct`/`%b` format tokens no longer hit cmd.exe variable expansion. Also merged `execFileSync` import alongside the existing `execSync` import on hook.ts (not duplicated).
+2. **Phase 5 — body-keyed revert detection, exact 40-char SHA.** Dropped the `subject.startsWith("Revert ")` gate on Case A (subjects vary; body is canonical). Tightened Case B regex to `[0-9a-f]{40}` — no abbreviated SHA fuzzy match (7-char collisions on moderate repos were a real risk).
+3. **Phase 6 — legacy scope fallback uses `deriveScope`, not `"unknown"` sentinel.** Added `deriveLegacyScope` helper in write-tools.ts. Falls back to the top-level directory segment of `changed_files[0]` (e.g. `src`), last resort `"root"`. Never stamps `"unknown"`. Pollution risk on the DecisionRecord space eliminated.
+4. **Phase 3 — precompiled regex patterns.** `compileBackupPatterns` hoisted above `del.filter` — O(patterns + files), not O(files × patterns). Added malformed-pattern try/catch with single-line stderr log, pattern skipped.
+5. **Phase 3 — defensive backslash normalization.** `isEditorBackup` calls `filepath.replace(/\\/g, "/")` before splitting — Windows paths from exotic call sites still match.
+6. **Phase 3 — default pattern list extended.** Added `.DS_Store` and `Thumbs.db` to DEFAULT_BACKUP_PATTERNS. Same UX problem as editor backups.
+7. **Phase 3 — scope narrowness and glob-semantic contract documented.** Suppression applies to Tier 1 `file-deletion` only (Tier 2 detectors unaffected). Patterns are filename-segment-only (user cannot pass `vendor/**/*.bak` to scope by path in this release). Both documented in Phase 3 STOP AND REPORT.
+8. **Phase 4 — first-file scope caveat documented.** For multi-file classification results, `perResultDerived` uses `changed_files[0]` — best-effort for mixed-scope commits. Users can reject the draft if the scope is wrong.
+9. **Phase 6.5 — NEW.** Added a CLI-render phase for pending inbox items. `src/cli.ts handleQuery` now prints `scope: <type>/<id>` for any draft that carries scope fields. Bug 8's population becomes visible without cat-ing JSONL.
+10. **Phase 7 — classify.test.ts expanded.** Added Test 5 (Windows backslash-path suppression — defensive portability) and Test 6 (.env.example NOT matched by `.#*` — anchor-boundary regression). Validation-gate count updated from 4 → 6 tests.
+
+**Bucket 2 — surfaced to user as Human Input Gate items (see below).** Not applied.
+
+**Bucket 3 — noted, not applied:**
+
+- Gemini's error-message wording nit (`"Missing proposed_record and legacy proposed_decision"` vs current `"Inbox item has no proposed record data"`). Either is fine; current wording ships.
+- Codex's suggestion that legacy-item evidence should be downgraded from `confirmed_draft` to `backfill_confirmed`. Valid concern but expands scope beyond the four bugs; flagged as Bucket 2 for user decision (see below).
+- Gemini's deferred-write staging design to eliminate Bug 9's "halves, not eliminates" compromise. This is a scope expansion worthy of its own feature cycle; flagged as Bucket 2.
+
+**Unresolved Bucket 2 items — require user input before execution.** See `triage-results.md`.
+
